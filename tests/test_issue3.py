@@ -37,7 +37,11 @@ class Issue3NoteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(candidate["candidate_id"], "0123456789abcdef01234567")
         self.assertEqual(candidate["source"], "xiaohongshu")
-        self.assertEqual(candidate["url"], SIGNED_URL)
+        self.assertEqual(
+            candidate["url"],
+            "https://www.xiaohongshu.com/discovery/item/0123456789abcdef01234567"
+            "?xsec_token=fixture-token&xsec_source=pc_search",
+        )
         self.assertEqual(candidate["text"], "今天沿溪流走了两小时。")
         self.assertEqual(candidate["title"], "山路")
         self.assertEqual(candidate["likes"], "12")

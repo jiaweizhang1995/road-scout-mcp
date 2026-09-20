@@ -14,7 +14,7 @@ import os
 import re
 import shutil
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -193,6 +193,53 @@ def _xhs_note_url(note_url: str) -> str:
     ):
         raise ValueError("note_url must be the full signed Xiaohongshu URL returned by search")
     return cleaned
+
+
+def _public_url(url: Any) -> Any:
+    """Rewrite an outbound Xiaohongshu note link to the phone-openable form.
+
+    Search-state URLs (``/search_result/<id>?xsec_token=...&xsec_source=``)
+    render as "页面不见了" outside the logged-in session.  The public shape is
+    ``https://www.xiaohongshu.com/discovery/item/<id>?xsec_token=<token>&xsec_source=pc_search``
+    with the token kept verbatim (its ``=`` padding URL-encoded as ``%3D``).
+    Non-Xiaohongshu links, non-note Xiaohongshu links, and anything that cannot
+    be converted are returned unchanged.  Internal reads and validation keep
+    using the original URL.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return url
+    parts = urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if host != "xiaohongshu.com" and not host.endswith(".xiaohongshu.com"):
+        return url
+    match = re.search(
+        r"/(?:explore|note|search_result|discovery/item)/([a-f0-9]+)(?:/|$)",
+        parts.path,
+        re.IGNORECASE,
+    )
+    if not match:
+        return url
+    token = ""
+    for pair in parts.query.split("&"):
+        if pair.startswith("xsec_token="):
+            token = unquote(pair.split("=", 1)[1]).strip()
+            break
+    if not token:
+        return url
+    return (
+        f"https://www.xiaohongshu.com/discovery/item/{match.group(1).lower()}"
+        f"?xsec_token={quote(token, safe='')}&xsec_source=pc_search"
+    )
+
+
+def _publicize_xhs_urls(data: Any) -> None:
+    """Rewrite note URLs inside a normalized Xiaohongshu result list in place."""
+    for row in _xhs_search_rows(data):
+        if isinstance(row.get("url"), str):
+            row["url"] = _public_url(row["url"])
+        raw = row.get("raw_search_result")
+        if isinstance(raw, dict) and isinstance(raw.get("url"), str):
+            raw["url"] = _public_url(raw["url"])
 
 
 def _xhs_search_rows(data: Any) -> list[dict[str, Any]]:
@@ -689,6 +736,9 @@ async def social_search(
     limit = max(1, min(limit, 20))
     selected = _select_sources(sources)
     results = await dispatch_sources(query, selected, limit)
+    xiaohongshu = results.get("xiaohongshu")
+    if isinstance(xiaohongshu, dict):
+        _publicize_xhs_urls(xiaohongshu.get("data"))
     return {
         "query": query,
         "status": _aggregate_status(results),
@@ -717,7 +767,9 @@ async def xiaohongshu_note(note_url: str) -> dict[str, Any]:
     """Read one full Xiaohongshu note from a signed search-result URL."""
     validated_url = _xhs_note_url(note_url)
     raw = await fetch_xiaohongshu_note(validated_url)
-    return _xiaohongshu_note_result(validated_url, raw)
+    result = _xiaohongshu_note_result(validated_url, raw)
+    result["candidate"]["url"] = _public_url(result["candidate"]["url"])
+    return result
 
 
 @mcp.tool()
@@ -1013,6 +1065,8 @@ async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences
     payload, eligible = build_jev_payload(candidates, preferences)
     if not eligible:
         results = rank_jev_results(candidates, {})
+        for item in results:
+            item["url"] = _public_url(item.get("url"))
         return {"ok": True, "answers": {}, "results": results, "candidates": results, "model": payload["model"]}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1025,6 +1079,8 @@ async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences
             body = response.json()
             answers = body.get("answers", {}) if isinstance(body, dict) else {}
             results = rank_jev_results(candidates, answers)
+            for item in results:
+                item["url"] = _public_url(item.get("url"))
             return {"ok": True, "answers": answers, "results": results, "candidates": results, "model": body.get("model", payload["model"])}
     except Exception as exc:  # keep the MCP tool useful when the service is unavailable
         return {"ok": False, "error": str(exc), "candidates": candidates}
@@ -1337,7 +1393,7 @@ def _to_recommendation(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": candidate.get("title") or candidate.get("name") or "",
         "source": candidate.get("source"),
-        "url": candidate.get("url"),
+        "url": _public_url(candidate.get("url")),
         "reason": candidate.get("reason"),
         "evidence_status": candidate.get("evidence_status"),
         "firsthand": _noul_value(candidate.get("firsthand")),
@@ -1430,6 +1486,17 @@ async def road_scout_recommend(
     selected = _preselect_candidates(pool, relevance_terms, MAX_RANKED_CANDIDATES)
     await _read_xhs_bodies(selected)
 
+    # jev_rank_candidates normalizes outbound URLs; restore the original signed
+    # URLs for internal follow-up reads (comments / note fetches).
+    original_urls = {c.get("candidate_id"): c.get("url") for c in selected}
+
+    def restore_urls(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        for item in items:
+            original = original_urls.get(item.get("candidate_id"))
+            if original:
+                item["url"] = original
+        return items
+
     ranked_result = await jev_rank_candidates(selected, prefs)
     if not ranked_result.get("ok"):
         notes.append(f"Jev 不可用：{ranked_result.get('error') or 'unknown error'}")
@@ -1447,14 +1514,14 @@ async def road_scout_recommend(
             stats={"candidates": len(pool), "ranked": len(selected), "filtered": 0, "followups": 0},
         )
 
-    ranked = ranked_result["results"]
+    ranked = restore_urls(ranked_result["results"])
 
     targets = _followup_targets(ranked)
     if targets:
         await asyncio.gather(*(_followup_candidate(target) for target in targets))
         rerank = await jev_rank_candidates(targets, prefs)
         if rerank.get("ok"):
-            updated = {item.get("candidate_id"): item for item in rerank["results"]}
+            updated = {item.get("candidate_id"): item for item in restore_urls(rerank["results"])}
             ranked = [updated.get(candidate.get("candidate_id"), candidate) for candidate in ranked]
             ranked.sort(key=lambda item: item.get("ranking", -1.0), reverse=True)
 
