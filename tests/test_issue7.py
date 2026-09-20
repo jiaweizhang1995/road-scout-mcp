@@ -347,6 +347,26 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(result["recommendations"]), 1)
 
+    async def test_low_ranking_candidate_goes_to_exploratory(self):
+        def scorer(candidate):
+            if "跑题" in (candidate.get("title") or ""):
+                return 0.2, 0.1, 0.1
+            return default_scorer(candidate)
+
+        result, _ = await self._run(
+            xhs=[
+                xhs_row("66" * 12, "跑题合集"),
+                xhs_row("77" * 12, "山顶草甸"),
+            ],
+            notes={
+                "66" * 12: note_raw("跑题合集", "这里是无关的城市展馆，内容仅作示例，和周边请求无关。"),
+                "77" * 12: note_raw("山顶草甸", GOOD_BODY),
+            },
+            jev_client=FakeJevClient(scorer),
+        )
+        self.assertEqual([item["name"] for item in result["recommendations"]], ["山顶草甸"])
+        self.assertEqual([item["name"] for item in result["exploratory"]], ["跑题合集"])
+
     async def test_same_note_deduped_across_queries(self):
         note_id = "66" * 12
         calls = iter(range(10))
@@ -516,6 +536,13 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class Issue7GeoTests(unittest.TestCase):
+    def test_food_city_names_include_parent_fallback(self):
+        self.assertEqual(server._food_city_names("广州番禺"), ["广州番禺", "广州"])
+        self.assertEqual(server._food_city_names("广州番禺区"), ["广州番禺区", "广州"])
+        self.assertEqual(server._food_city_names("呼和浩特"), ["呼和浩特"])
+        self.assertEqual(server._food_city_names("西双版纳"), ["西双版纳"])
+        self.assertEqual(server._food_city_names("广州市"), ["广州市"])
+
     def test_parse_radius_kilometers(self):
         self.assertEqual(server._parse_radius_km("杭州附近100公里"), 100.0)
         self.assertEqual(server._parse_radius_km("周边 30km 自驾"), 30.0)

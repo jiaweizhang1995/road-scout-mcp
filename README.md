@@ -129,9 +129,11 @@ follow-up step — no point fetching comments for a place too far away.
 The result is `recommendations` (`supported`/`marketing_risk`, capped by
 `max_results`, never padded, each with `distance_km`), a small `exploratory`
 list for `insufficient` or out-of-range leads, an optional `food` section from
-the Amap city ranking when the request is about eating, a `geo` section
+the Amap city ranking when the request is about eating (with a simple
+parent-city fallback for inputs such as `广州番禺`), a `geo` section
 (reporting the resolved origin, radius, and geocoder used), per-source
-`source_status`, and `notes`. A failed source never fails the whole call.
+`source_status`, and `notes`. Low-ranking candidates stay in `exploratory`.
+A failed source never fails the whole call.
 Non-Xiaohongshu candidates rely on search snippets and are marked as weaker
 evidence in `risks`.
 
