@@ -33,6 +33,21 @@ No cookie is exported by this project. The MCP server invokes read-only
 OpenCLI commands, and it never exposes arbitrary shell execution or social
 write actions.
 
+## Xiaohongshu note content
+
+`xiaohongshu_note(note_url)` calls the locally installed
+`opencli xiaohongshu note <note-url> -f json` command. The URL must be the
+complete signed URL returned by search, including `xsec_token`; the server
+never reconstructs it from a note ID. OpenCLI currently returns field/value
+rows, including `content`, `title`, `author`, `likes`, `collects`, and
+`comments`.
+
+Search results are converted into small Jev candidates and de-duplicated by
+the note identity in the original URL (so different signed tokens for the
+same note do not repeat a body read). Their `text` remains empty until `xiaohongshu_note` reads
+the body. A note read failure returns `unavailable` with an empty `text`; a
+title is never copied into the body field.
+
 ## Search result contract
 
 `social_search` uses one source registry for direct searches and

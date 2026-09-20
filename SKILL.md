@@ -51,7 +51,13 @@ version: 1.4.1
 
 用户要求近期视频、现场氛围或短视频线索时，调用 `douyin_search`。抖音营销和团购内容较多，必须交给 Jev 降权，不能单独作为真实体验证明。
 
-### 5. 评论区证据
+### 5. `xiaohongshu_note`：读取正文
+
+对去重后的每个小红书候选调用 `xiaohongshu_note(note_url)`。`note_url` 必须直接使用 search 返回的完整 signed URL（包括 `xsec_token`）；不要从 note ID 重建 URL，也不要伪造 token。
+
+工具返回可直接交给 Jev 的候选对象，保留原始 `url`、正文 `text`、标题、作者和互动字段。正文读取失败时保留空 `text` 并标记不可用，不能把标题当正文，也不要把读取失败解释成负面评价。
+
+### 6. 评论区证据
 
 - 对进入候选集的前 10 条小红书笔记，调用 `xiaohongshu_comments(note_url, limit=20, with_replies=true)`；若候选不足 10 条，则全部调用。
 - 优先拉取高匹配但信息不完整、评论出现争议、或需要核验交通/停车/门票的笔记；不要对所有召回结果无差别拉评论，以免变慢或触发平台限制。
@@ -59,7 +65,7 @@ version: 1.4.1
 - 抖音当前 OpenCLI 只提供 `douyin_creator_comments(sec_uid, limit=5, comment_limit=10)`，返回创作者近期视频的 `top_comments`。`douyin_search` 的搜索结果没有可靠 `sec_uid`，也没有直接按任意视频 URL 拉评论的命令；无法获得 `sec_uid` 时明确标记“抖音评论未拉取”，不要猜测或伪造。
 - 抖音评论同样要交给 Jev 降权营销、团购和商家自营内容，并优先采用包含具体路线、价格、排队、停车或踩坑的评论。
 
-### 6. `jev_rank_candidates`：证据判断与精排
+### 7. `jev_rank_candidates`：证据判断与精排
 
 先合并、去重候选，再传入最多 12 个最有价值的候选。每个候选尽量包含：名称、来源、原始链接、作者、点赞/收藏、发布时间、正文或摘要证据和 `comment_evidence`。先合并帖子与评论，再去重；评论只增强证据，不改变原帖来源。
 
@@ -71,18 +77,18 @@ version: 1.4.1
 
 不要把 Jev 概率当成事实证明；它是排序信号。
 
-### 6. `road_scout_status`
+### 8. `road_scout_status`
 
 只在首次使用、调用失败或用户要求诊断时调用。不要把完整 doctor 输出直接展示给用户，只提炼可操作的故障原因。
 
 ## 推荐流程
 
 1. 获取当前位置和城市名。
-2. 调用 `nearby_discover` 获取小红书、B站、抖音、网页和高德候选。
-3. 对用户指定的参考地点，额外调用 `social_search` 做相似风格搜索。
-4. 对前 10 条小红书候选调用 `xiaohongshu_comments`；只有拿到可靠 `sec_uid` 时才调用 `douyin_creator_comments`。
-5. 去重、提取地点实体，区分帖子证据与评论证据，补齐来源链接。
-6. 调用 `jev_rank_candidates` 精排。
+2. 调用 `nearby_discover` 或 `social_search` 获取小红书候选。
+3. 按 note 身份去重候选，保留第一次 search 返回的完整 signed URL。
+4. 对去重后的候选调用 `xiaohongshu_note` 读取正文。
+5. 按需补充少量 `xiaohongshu_comments`；评论不是每条候选都必须拉取。
+6. 将正文和其他原始字段交给 `jev_rank_candidates` 精排，不让 Agent 自己生成的摘要替代正文。
 7. 输出 3–6 个推荐；吃饭单独列出高德榜候选。
 
 ## 输出要求
