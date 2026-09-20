@@ -37,7 +37,7 @@ class Issue2DispatchTests(unittest.IsolatedAsyncioTestCase):
             await server.social_search("route", ["unknown"])
 
     async def test_query_and_limit_boundaries(self):
-        with patch.object(server, "search_web", new=AsyncMock(return_value={"ok": True, "data": []})) as web:
+        with patch.object(server, "search_web", new=AsyncMock(return_value={"ok": True, "data": {"content": []}})) as web:
             result = await server.social_search("  route  ", ["web"], limit=999)
         web.assert_awaited_once_with("route", 20)
         self.assertEqual(result["results"]["web"]["status"], "empty")
@@ -48,16 +48,42 @@ class Issue2DispatchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_source_failure_keeps_other_source_success(self):
         with patch.object(server, "search_xiaohongshu", new=AsyncMock(side_effect=RuntimeError("offline"))), patch.object(
-            server, "search_web", new=AsyncMock(return_value={"ok": True, "data": [{"title": "trail"}]})
+            server, "search_web", new=AsyncMock(return_value={"ok": True, "data": {"content": [{"type": "text", "text": "trail"}]}})
         ):
             result = await server.social_search("route", ["xiaohongshu", "web"])
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["results"]["xiaohongshu"]["status"], "unavailable")
         self.assertEqual(result["results"]["web"]["status"], "ok")
 
+    async def test_source_level_partial_is_preserved(self):
+        with patch.object(
+            server,
+            "search_web",
+            new=AsyncMock(
+                return_value={
+                    "process_ok": True,
+                    "status": "partial",
+                    "data": {"content": [{"type": "text", "text": "one result"}]},
+                    "parse_error": None,
+                }
+            ),
+        ):
+            result = await server.social_search("route", ["web"])
+        self.assertEqual(result["results"]["web"]["status"], "partial")
+        self.assertEqual(result["status"], "partial")
+
+    def test_partial_aggregate_combinations(self):
+        partial = {"status": "partial"}
+        ok = {"status": "ok"}
+        empty = {"status": "empty"}
+        failure = {"status": "unavailable"}
+        self.assertEqual(server._aggregate_status({"a": partial, "b": ok}), "partial")
+        self.assertEqual(server._aggregate_status({"a": partial, "b": empty}), "partial")
+        self.assertEqual(server._aggregate_status({"a": partial, "b": failure}), "partial")
+
     async def test_duplicate_sources_are_deduplicated_and_ordered(self):
         with patch.object(server, "search_bilibili", new=AsyncMock(return_value={"ok": True, "data": []})) as bili, patch.object(
-            server, "search_web", new=AsyncMock(return_value={"ok": True, "data": []})
+            server, "search_web", new=AsyncMock(return_value={"ok": True, "data": {"content": []}})
         ) as web:
             result = await server.social_search("route", ["bilibili", "web", "bilibili"], limit=2)
         self.assertEqual(list(result["results"]), ["bilibili", "web"])
@@ -77,7 +103,11 @@ class Issue2CommandContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["parse_error"])
 
     async def test_business_is_error_is_not_inferred_from_text(self):
-        raw = {"process_ok": True, "data": {"message": "error text"}, "parse_error": None}
+        raw = {
+            "process_ok": True,
+            "data": {"content": [{"type": "text", "text": "error text"}]},
+            "parse_error": None,
+        }
         normalized = server.normalize_adapter_result("exa", raw)
         self.assertEqual(normalized["status"], "ok")
 
@@ -93,6 +123,12 @@ class Issue2CommandContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(normalized["status"], "parse_error")
         self.assertEqual(normalized["error"]["code"], "invalid_shape")
 
+    async def test_json_unexpected_object_shape_is_parse_error(self):
+        raw = {"process_ok": True, "data": {"unexpected": True}, "parse_error": None}
+        normalized = server.normalize_adapter_result("web", raw)
+        self.assertEqual(normalized["status"], "parse_error")
+        self.assertEqual(normalized["error"]["code"], "invalid_shape")
+
     async def test_mcp_content_blocks_are_preserved(self):
         data = {"isError": False, "content": [{"type": "text", "text": "result"}]}
         normalized = server.normalize_adapter_result(
@@ -100,6 +136,19 @@ class Issue2CommandContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(normalized["status"], "ok")
         self.assertEqual(normalized["data"], data)
+
+    async def test_nearby_wrapper_exception_uses_result_contract(self):
+        with patch.object(server, "fetch_gaode_food_ranking", new=AsyncMock(return_value={"ok": True, "items": []})):
+            result = await server.nearby_discover(
+                31.2,
+                121.5,
+                area_name="上海" + "x" * server.MAX_QUERY_LENGTH,
+                categories=["景点"],
+            )
+        wrapped = result["evidence"][0]["results"]["xiaohongshu"]
+        self.assertEqual(wrapped["status"], "unavailable")
+        self.assertEqual(wrapped["source"], "xiaohongshu")
+        self.assertEqual(wrapped["error"]["code"], "wrapper_exception")
 
 
 class Issue2ExaContractTests(unittest.TestCase):

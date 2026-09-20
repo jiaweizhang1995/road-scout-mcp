@@ -36,6 +36,7 @@ COMMAND_TIMEOUT = float(os.getenv("ROAD_SCOUT_COMMAND_TIMEOUT", "90"))
 MAX_QUERY_LENGTH = 500
 DEFAULT_SOURCES = ("xiaohongshu", "bilibili", "web")
 SUCCESS_STATUSES = {"ok", "empty", "partial"}
+FAILURE_STATUSES = {"unavailable", "parse_error"}
 
 mcp = FastMCP(
     "road-scout",
@@ -122,12 +123,30 @@ def _data_is_empty(data: Any) -> bool:
     return False
 
 
+def _has_valid_shape(source: str, data: Any) -> bool:
+    """Check only the stable outer shape promised by each local adapter."""
+    if source in {"xiaohongshu", "bilibili", "douyin"}:
+        # OpenCLI -f json search commands return a result array. Some versions
+        # wrap it in a documented results/items/data list; reject arbitrary
+        # objects so diagnostics cannot be mistaken for search results.
+        return isinstance(data, list) or (
+            isinstance(data, dict)
+            and any(isinstance(data.get(key), list) for key in ("results", "items", "data"))
+        )
+    if source in {"web", "exa"}:
+        # mcporter's MCP result is an object with content blocks. isError is
+        # handled separately, but a normal result still needs content.
+        return isinstance(data, dict) and isinstance(data.get("content"), list)
+    return False
+
+
 def normalize_adapter_result(source: str, raw: dict[str, Any]) -> dict[str, Any]:
     """Convert a command/MCP response to the public source result contract."""
     process_ok = raw.get("process_ok", raw.get("ok", False))
     parse_error = raw.get("parse_error")
     data = raw.get("data")
     error = raw.get("error")
+    requested_status = raw.get("status")
     if not process_ok:
         if not isinstance(error, dict):
             error = _error(
@@ -142,11 +161,13 @@ def normalize_adapter_result(source: str, raw: dict[str, Any]) -> dict[str, Any]
     elif isinstance(data, dict) and data.get("isError") is True:
         status = "unavailable"
         error = _error("mcp_is_error", "MCP tool reported a business failure", content=data.get("content"))
-    elif not isinstance(data, (dict, list)):
+    elif not _has_valid_shape(source, data):
         status = "parse_error"
-        error = _error("invalid_shape", "search adapter returned a non-object/non-array JSON value")
+        error = _error("invalid_shape", f"{source} adapter returned an unexpected JSON shape")
     else:
-        status = "empty" if _data_is_empty(data) else "ok"
+        status = requested_status if requested_status in SUCCESS_STATUSES else (
+            "empty" if _data_is_empty(data) else "ok"
+        )
         error = None
     return {
         "status": status,
@@ -315,13 +336,15 @@ def _aggregate_status(results: dict[str, dict[str, Any]]) -> str:
     statuses = [result["status"] for result in results.values()]
     if not statuses:
         return "unavailable"
+    if any(status == "partial" for status in statuses):
+        return "partial"
+    has_failure = any(status in FAILURE_STATUSES for status in statuses)
+    has_success = any(status in {"ok", "empty"} for status in statuses)
+    if has_failure:
+        return "partial" if has_success else "unavailable"
     if all(status == "empty" for status in statuses):
         return "empty"
-    if all(status in SUCCESS_STATUSES for status in statuses):
-        return "ok"
-    if any(status in SUCCESS_STATUSES for status in statuses):
-        return "partial"
-    return "unavailable"
+    return "ok"
 
 
 async def dispatch_sources(query: str, sources: list[str], limit: int) -> dict[str, dict[str, Any]]:
@@ -519,7 +542,13 @@ async def nearby_discover(
             "query": query,
             "results": {
                 source: (
-                    {"ok": False, "error": str(result)}
+                    normalize_adapter_result(
+                        source,
+                        {
+                            "process_ok": False,
+                            "error": _error("wrapper_exception", str(result)),
+                        },
+                    )
                     if isinstance(result, Exception)
                     else result.get("results", {}).get(source, result)
                 )

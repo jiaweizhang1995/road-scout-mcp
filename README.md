@@ -44,6 +44,11 @@ are de-duplicated in first-seen order. The supported source names are
 
 Each source result has a `status` of `ok`, `empty`, `partial`, `unavailable`, or
 `parse_error`, plus `source`, `data`, and a structured `error` when applicable.
+Adapters may explicitly return `status: "partial"`; the aggregate search status
+preserves that partial result for combinations with successful, empty, or failed
+sources. OpenCLI search results must be an array or a documented list wrapper;
+the Exa MCP result must contain MCP `content` blocks. Unexpected JSON shapes are
+reported as `parse_error`.
 The legacy boolean `ok` is retained for clients that still read it; it is true
 for `ok`, `empty`, and `partial`. A successful process with an MCP
 `isError: true` response is `unavailable`, while malformed JSON or a scalar
