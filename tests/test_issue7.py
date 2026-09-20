@@ -538,6 +538,9 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
 class Issue7GeoTests(unittest.TestCase):
     def test_food_city_names_include_parent_fallback(self):
         self.assertEqual(server._food_city_names("广州番禺"), ["广州番禺", "广州"])
+        self.assertEqual(server._food_city_names("广州番禺区"), ["广州番禺区", "广州"])
+        self.assertEqual(server._food_city_names("呼和浩特"), ["呼和浩特"])
+        self.assertEqual(server._food_city_names("西双版纳"), ["西双版纳"])
         self.assertEqual(server._food_city_names("广州市"), ["广州市"])
 
     def test_parse_radius_kilometers(self):

@@ -51,6 +51,11 @@ SEARCH_LIMIT_PER_SOURCE = 10
 MAX_RANKED_CANDIDATES = 10
 MAX_FOLLOWUP_CANDIDATES = 3
 MIN_RECOMMEND_RANKING = 0.1
+_COMPACT_CITY_PREFIXES = (
+    "北京", "上海", "广州", "深圳", "杭州", "南京", "苏州", "成都", "武汉",
+    "西安", "重庆", "厦门", "福州", "长沙", "佛山", "东莞", "宁波", "青岛",
+    "合肥", "郑州", "济南",
+)
 FOLLOWUP_COMMENT_LIMIT = 15
 MAX_EXPLORATORY = 3
 FOOD_KEYWORDS = ("吃", "餐", "美食", "饭")
@@ -691,11 +696,15 @@ def _food_city_names(city_name: str) -> list[str]:
     """Return the requested city and one simple parent-city fallback."""
     cleaned = re.sub(r"\s+", "", city_name.strip())
     names = [cleaned]
-    # Common compact inputs such as ``广州番禺`` or ``杭州西湖`` omit the
-    # district suffix. Removing the final two characters gets the parent city
-    # without adding a city database or another dependency.
-    if len(cleaned) >= 4 and not cleaned.endswith(("市", "地区")):
-        names.append(cleaned[:-2])
+    # Only fall back when the input clearly contains a district/county. For
+    # compact inputs without the suffix, require a known two-character city
+    # prefix; otherwise a valid four-character city could be truncated.
+    compact = cleaned.removesuffix("区").removesuffix("县").removesuffix("市")
+    compact = compact.replace("市", "")
+    for prefix in _COMPACT_CITY_PREFIXES:
+        if compact.startswith(prefix) and len(compact) > len(prefix):
+            names.append(prefix)
+            break
     return list(dict.fromkeys(name for name in names if name))
 
 
@@ -1399,7 +1408,7 @@ def _followup_targets(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if _has_practical_info(candidate):
             continue
-        if status in ("supported", "marketing_risk") and (candidate.get("ranking") or 0) < 0.1:
+        if status in ("supported", "marketing_risk") and (candidate.get("ranking") or 0) < MIN_RECOMMEND_RANKING:
             continue
         if status == "insufficient" and candidate.get("body_status") == "unavailable":
             continue  # comments alone cannot rescue a missing body
