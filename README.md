@@ -110,10 +110,14 @@ Distance constraints: `radius_km` caps how far recommendations may be, or the
 same limit is parsed from `request` ("附近100公里", "500米内"; the explicit
 parameter wins). The origin is `latitude`/`longitude` (declared WGS-84;
 converted to GCJ-02 automatically when `AMAP_API_KEY` is set so it compares
-like-for-like with Amap POIs) when both are given, otherwise `area_name` is
-geocoded — via Amap when `AMAP_API_KEY` is set, else Nominatim with a
-display-name sanity check (China POI coverage is limited; unresolved places
-keep `distance_km: null` and are never filtered out). Nominatim calls are
+like-for-like with Amap coordinates) when both are given, otherwise
+`area_name` is geocoded — via Amap `geocode/geo` when `AMAP_API_KEY` is set,
+else Nominatim with a display-name sanity check. `distance_km` is an
+approximate straight-line distance for range filtering, not actual driving
+mileage. Niche places may not resolve to coordinates at all — they keep
+`distance_km: null` ("距离未知") and are never filtered out; Amap's
+city-or-coarser fallback levels are treated as unknown too, since the area
+centroid would produce a wrongly small distance. Nominatim calls are
 throttled to the OSMF public-service limit of 1 request/second and the `geo`
 output carries attribution; data © OpenStreetMap contributors.
 Ranked candidates are deduplicated by place (multiple notes about one place

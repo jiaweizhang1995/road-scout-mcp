@@ -64,9 +64,19 @@ EVIDENCE_KEYWORDS = PRACTICAL_KEYWORDS + (
 )
 AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_MIN_INTERVAL = 1.0  # OSMF public-service policy: at most 1 req/s
 GEO_TIMEOUT = 15
-_last_nominatim_call = 0.0
+# Per-provider minimum interval between requests: Nominatim's public-service
+# policy is a hard 1 req/s; Amap personal keys rate-limit near 3 QPS and
+# silently drop bursts, so calls are spaced to stay comfortably under it.
+GEO_MIN_INTERVAL = {"nominatim": 1.0, "amap": 0.5}
+_last_geo_call: dict[str, float] = {}
+
+
+async def _geo_throttle(provider: str) -> None:
+    delay = GEO_MIN_INTERVAL[provider] - (time.monotonic() - _last_geo_call.get(provider, 0.0))
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _last_geo_call[provider] = time.monotonic()
 
 mcp = FastMCP(
     "road-scout",
@@ -1292,12 +1302,40 @@ def _comment_texts(raw: dict[str, Any]) -> list[str]:
 
 
 _PLACE_SUFFIX = "山顶|山|湖|村|镇|民宿|营地|景区|公园|古道|瀑布|溪谷|峡谷|草甸|农庄|水库|岛|溪|寺|桥|湾"
+# Explicit phrase prefixes seen in note bodies ("沿着山脊", "住在山边"); only
+# whole phrases are stripped, never character sets, so 藏马山 stays 藏马山.
+_PLACE_NOISE_PREFIXES = (
+    "沿着", "枕着", "住在", "住进", "来到", "去了", "到达", "位于",
+    "打卡", "藏在", "途经", "经过", "导航到", "走进", "逛到",
+)
+# Modal/aspect particles: a token containing one is a sentence fragment, not a
+# place ("正的避世民宿"). They also can never lead a name, so leading ones are
+# stripped. 地 is deliberately absent — real names like 西溪湿地公园 need it.
+_PLACE_BAD_CHARS = "的着了呢吗吧啊哦呀嘛被"
+
+
+def _clean_place(place: str) -> str:
+    """Clean a text-field place token; title tokens are returned untouched."""
+    place = place.lstrip(_PLACE_BAD_CHARS)
+    for prefix in _PLACE_NOISE_PREFIXES:
+        if place.startswith(prefix):
+            place = place[len(prefix):]
+            break
+    if len(place) < 2 or any(char in place for char in _PLACE_BAD_CHARS):
+        return ""
+    return place
 
 
 def _extract_place(candidate: dict[str, Any]) -> str:
-    """Best-effort place token: longest suffix span in the first place-like run."""
+    """Best-effort place token: longest suffix span in the first place-like run.
+
+    A confident title match (suffix within the first few chars of a run) wins
+    outright and is returned verbatim — real names must never be mangled. A
+    title fallback beats any text-field hit so sentence fragments like
+    "沿着山脊" cannot override a real title place.
+    """
     fallback = ""
-    for field in (candidate.get("title"), candidate.get("text")):
+    for field_index, field in enumerate((candidate.get("title"), candidate.get("text"))):
         if not isinstance(field, str):
             continue
         for run in re.findall(r"[一-鿿]{2,}", field):
@@ -1305,8 +1343,14 @@ def _extract_place(candidate: dict[str, Any]) -> str:
             if not matches:
                 continue
             first, last = matches[0], matches[-1]
-            place = run[max(0, last.start() - 4) : last.end()]
-            if first.start() <= 3:
+            raw = run[max(0, last.start() - 4) : last.end()]
+            place = raw if field_index == 0 else _clean_place(raw)
+            if len(place) < 2:
+                continue
+            # Confident only when nothing better seen yet: an earlier fallback
+            # (e.g. title run "永泰白杜民宿") beats a later run's early suffix
+            # hit (e.g. "推门见山"), which is usually a phrase, not a place.
+            if first.start() <= 3 and not fallback:
                 return place
             if not fallback:
                 fallback = place
@@ -1460,16 +1504,24 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 async def _amap_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        async with httpx.AsyncClient(timeout=GEO_TIMEOUT) as client:
-            response = await client.get(
-                f"https://restapi.amap.com{path}",
-                params={**params, "key": AMAP_API_KEY, "output": "json"},
-            )
-            body = response.json()
-        return body if isinstance(body, dict) and body.get("status") == "1" else None
-    except Exception:
+    for _ in range(2):
+        await _geo_throttle("amap")
+        try:
+            async with httpx.AsyncClient(timeout=GEO_TIMEOUT) as client:
+                body = (
+                    await client.get(
+                        f"https://restapi.amap.com{path}",
+                        params={**params, "key": AMAP_API_KEY, "output": "json"},
+                    )
+                ).json()
+        except Exception:
+            continue  # transient network/parse failure; one retry is enough
+        if isinstance(body, dict) and body.get("status") == "1":
+            return body
+        if isinstance(body, dict) and body.get("infocode") == "10021":
+            continue  # QPS-limited; the throttle spaces the retry
         return None
+    return None
 
 
 def _split_lng_lat(location: Any) -> tuple[float, float] | None:
@@ -1494,27 +1546,31 @@ async def geocode_area(area: str) -> tuple[float, float, str] | None:
     return await _nominatim_geocode(area, must_contain=(area,))
 
 
+# Amap geocode degrades to progressively coarser matches; a city-or-coarser
+# hit means the place itself was not found and the returned coords are just
+# the area centroid — treat as unknown rather than a wrong near distance.
+# The API returns short forms (市, 区县) so both spellings are covered.
+_COARSE_GEOCODE_LEVELS = {"国家", "省", "省份", "市", "城市", "区县", "县", "区", "开发区"}
+
+
 async def geocode_place(place: str, area: str) -> tuple[float, float, str] | None:
-    """Resolve one candidate place. Returns (lat, lon, label)."""
+    """Turn a discovered place name into approximate coordinates."""
     if AMAP_API_KEY:
+        address = f"{area}{place}" if area else place
         body = await _amap_get(
-            "/v3/place/text",
-            {"keywords": place, "city": area or "", "citylimit": "true" if area else "false"},
+            "/v3/geocode/geo", {"address": address, "city": area or ""}
         )
-        pois = (body or {}).get("pois") or []
-        point = _split_lng_lat(pois[0].get("location")) if pois else None
-        if point:
-            return point[0], point[1], str(pois[0].get("name") or place)
+        codes = (body or {}).get("geocodes") or []
+        code = codes[0] if codes else {}
+        point = _split_lng_lat(code.get("location"))
+        if point and code.get("level") not in _COARSE_GEOCODE_LEVELS:
+            return point[0], point[1], str(code.get("formatted_address") or address)
         return None
     return await _nominatim_geocode(f"{place} {area}".strip(), must_contain=(place,))
 
 
 async def _nominatim_geocode(query: str, must_contain: tuple[str, ...]) -> tuple[float, float, str] | None:
-    global _last_nominatim_call
-    delay = NOMINATIM_MIN_INTERVAL - (time.monotonic() - _last_nominatim_call)
-    if delay > 0:
-        await asyncio.sleep(delay)
-    _last_nominatim_call = time.monotonic()
+    await _geo_throttle("nominatim")
     try:
         async with httpx.AsyncClient(
             timeout=GEO_TIMEOUT,
