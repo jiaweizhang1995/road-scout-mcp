@@ -29,11 +29,19 @@ version: 1.5.0
 - `preferences`：传用户真正表达的偏好。不要为了迎合默认模板自动追加“禅意”“寺院”“静修”等词。
 - `include_food`：包含吃饭需求时设为 true。
 - `max_results`：正式推荐上限，默认 5。候选不够好时返回更少，不凑数。
+- `radius_km`：距离上限（公里）。不传时会尝试从 `request` 解析“附近X公里/X米”；显式传参优先于文本解析。
+- `latitude` / `longitude`：起点坐标，需成对提供。缺省用 `area_name` 地理编码（配置了 `AMAP_API_KEY` 走高德，否则 Nominatim）。
+
+距离语义：
+
+- 每条推荐带 `distance_km`；超出半径的候选降级到 `exploratory` 并在 `risks` 里标注距离。
+- 地点无法地理编码时 `distance_km` 为 `null` 并标“距离未知”，不会因为算不出距离被误删。
+- 多条笔记指向同一地点时合并为一条，`mentions` 记录被合并的笔记数。
 
 返回语义：
 
 - `recommendations`：正式推荐，只包含 `supported` 或 `marketing_risk`。
-- `exploratory`：`insufficient`，有潜力但证据不足，只能作为备选线索。
+- `exploratory`：`insufficient`（证据不足）或 `out_of_range`（超距离），只能作为备选线索。
 - `filtered`：已被筛掉，不应重新放回推荐。
 - `food`：高德美食榜候选，仅在美食意图下使用。
 - `source_status` / `notes`：用于判断覆盖是否受影响，不必全部展示给用户。

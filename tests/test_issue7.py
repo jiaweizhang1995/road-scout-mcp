@@ -155,6 +155,8 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         gaode=None,
         jev_client=None,
         jev_off=False,
+        origin=None,
+        geocoder=None,
         **tool_kwargs,
     ):
         notes = notes or {}
@@ -188,6 +190,17 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(patch.object(server, "fetch_xiaohongshu_note", new=note_mock))
             stack.enter_context(patch.object(server, "fetch_xiaohongshu_comments", new=comments_mock))
             stack.enter_context(patch.object(server, "fetch_gaode_food_ranking", new=gaode_mock))
+            stack.enter_context(
+                patch.object(server, "geocode_area", new=AsyncMock(return_value=origin))
+            )
+            geo_map = geocoder or {}
+            stack.enter_context(
+                patch.object(
+                    server,
+                    "geocode_place",
+                    new=AsyncMock(side_effect=lambda place, area="": geo_map.get(place)),
+                )
+            )
             env = {"TYPESAFE_API_KEY": ""} if jev_off else {"TYPESAFE_API_KEY": "test-key"}
             stack.enter_context(patch.dict(os.environ, env))
             if jev_client is not None:
@@ -310,10 +323,13 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("营销" in risk for risk in rec["risks"]))
 
     async def test_max_results_caps_and_never_pads(self):
+        places = ["龙溪草甸", "千岛湖", "大明山", "青山湖", "天目山", "径山寺"]
         rows = [xhs_row(f"{index:024x}", f"候选{index}") for index in range(6)]
         result, _ = await self._run(
             xhs=rows,
-            notes={f"{index:024x}": note_raw(f"候选{index}", GOOD_BODY) for index in range(6)},
+            notes={
+                f"{index:024x}": note_raw(places[index], GOOD_BODY) for index in range(6)
+            },
             jev_client=FakeJevClient(default_scorer),
             max_results=3,
         )
@@ -390,6 +406,150 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("%3D", rec["url"])
         # internal comment fetch still received the original signed URL
         self.assertEqual(mocks["comments"].await_args.args[0], signed_url(note_id, "tok=fixture="))
+
+    async def test_radius_from_request_moves_far_candidate_to_exploratory(self):
+        result, _ = await self._run(
+            xhs=[
+                xhs_row("a1" * 12, "龙溪草甸徒步"),
+                xhs_row("b2" * 12, "千岛湖自驾"),
+            ],
+            notes={
+                "a1" * 12: note_raw("龙溪草甸", GOOD_BODY),
+                "b2" * 12: note_raw("千岛湖", "周六到达千岛湖，湖边免费停车，门票一百元，人少。"),
+            },
+            jev_client=FakeJevClient(default_scorer),
+            request="杭州附近100公里 小众自驾",
+            origin=(30.27, 120.15, "杭州"),
+            geocoder={
+                "龙溪草甸": (30.35, 120.25, "龙溪草甸"),
+                "千岛湖": (29.60, 119.00, "千岛湖"),
+            },
+        )
+        self.assertEqual(result["geo"]["radius_km"], 100.0)
+        self.assertEqual(result["geo"]["origin"]["latitude"], 30.27)
+        self.assertEqual(len(result["recommendations"]), 1)
+        near = result["recommendations"][0]
+        self.assertIsNotNone(near["distance_km"])
+        self.assertLess(near["distance_km"], 50)
+        self.assertEqual(len(result["exploratory"]), 1)
+        far = result["exploratory"][0]
+        self.assertGreater(far["distance_km"], 100)
+        self.assertEqual(far["evidence_status"], "supported")
+        self.assertTrue(any("超出" in risk for risk in far["risks"]))
+        self.assertEqual(result["stats"]["out_of_range"], 1)
+
+    async def test_out_of_range_candidate_skips_followup(self):
+        note_id = "c3" * 12
+        result, mocks = await self._run(
+            xhs=[xhs_row(note_id, "千岛湖放空")],
+            notes={note_id: note_raw("千岛湖", "周末去了千岛湖，湖面开阔，光线柔和，人也不多，适合发呆。")},
+            comments=["不会被拉取的评论"],
+            jev_client=FakeJevClient(default_scorer),
+            request="杭州附近50公里 小众",
+            origin=(30.27, 120.15, "杭州"),
+            geocoder={"千岛湖": (29.60, 119.00, "千岛湖")},
+        )
+        mocks["comments"].assert_not_awaited()
+        self.assertEqual(result["recommendations"], [])
+        self.assertEqual(len(result["exploratory"]), 1)
+        self.assertGreater(result["exploratory"][0]["distance_km"], 50)
+
+    async def test_explicit_radius_and_latlon_override_request_text(self):
+        result, _ = await self._run(
+            xhs=[xhs_row("d4" * 12, "龙溪草甸徒步")],
+            notes={"d4" * 12: note_raw("龙溪草甸", GOOD_BODY)},
+            jev_client=FakeJevClient(default_scorer),
+            request="杭州附近500米 小众自驾",
+            radius_km=50,
+            latitude=30.27,
+            longitude=120.15,
+            geocoder={"龙溪草甸": (30.35, 120.25, "龙溪草甸")},
+        )
+        # explicit radius_km=50 wins over "500米" in the request
+        self.assertEqual(result["geo"]["radius_km"], 50.0)
+        self.assertEqual(result["geo"]["origin"]["label"], "指定坐标")
+        self.assertEqual(len(result["recommendations"]), 1)
+        self.assertIsNotNone(result["recommendations"][0]["distance_km"])
+
+    async def test_unresolved_distance_is_never_filtered(self):
+        result, _ = await self._run(
+            xhs=[xhs_row("e5" * 12, "龙溪草甸徒步")],
+            notes={"e5" * 12: note_raw("龙溪草甸", GOOD_BODY)},
+            jev_client=FakeJevClient(default_scorer),
+            request="杭州附近100公里 小众",
+            origin=(30.27, 120.15, "杭州"),
+            geocoder={},  # place cannot be resolved
+        )
+        self.assertEqual(len(result["recommendations"]), 1)
+        rec = result["recommendations"][0]
+        self.assertIsNone(rec["distance_km"])
+        self.assertTrue(any("距离未知" in risk for risk in rec["risks"]))
+
+    async def test_radius_without_origin_leaves_note(self):
+        result, _ = await self._run(
+            xhs=[xhs_row("f6" * 12, "龙溪草甸徒步")],
+            notes={"f6" * 12: note_raw("龙溪草甸", GOOD_BODY)},
+            jev_client=FakeJevClient(default_scorer),
+            request="附近100公里 小众地方",
+            area_name="",
+        )
+        self.assertTrue(any("距离" in note for note in result["notes"]))
+        self.assertEqual(len(result["recommendations"]), 1)
+        self.assertIsNone(result["recommendations"][0]["distance_km"])
+        self.assertIsNone(result["geo"]["origin"])
+
+    async def test_same_place_multiple_notes_collapse(self):
+        result, _ = await self._run(
+            xhs=[
+                xhs_row("07" * 12, "龙溪草甸徒步记"),
+                xhs_row("08" * 12, "龙溪草甸露营攻略"),
+            ],
+            notes={
+                "07" * 12: note_raw("龙溪草甸", GOOD_BODY),
+                "08" * 12: note_raw("龙溪草甸", "周日到达龙溪草甸，草地很大，停车免费，门票无。"),
+            },
+            jev_client=FakeJevClient(default_scorer),
+        )
+        self.assertEqual(len(result["recommendations"]), 1)
+        self.assertEqual(result["recommendations"][0]["mentions"], 2)
+
+
+class Issue7GeoTests(unittest.TestCase):
+    def test_parse_radius_kilometers(self):
+        self.assertEqual(server._parse_radius_km("杭州附近100公里"), 100.0)
+        self.assertEqual(server._parse_radius_km("周边 30km 自驾"), 30.0)
+        self.assertEqual(server._parse_radius_km("50千米以内"), 50.0)
+
+    def test_parse_radius_meters(self):
+        self.assertEqual(server._parse_radius_km("附近500米"), 0.5)
+        self.assertEqual(server._parse_radius_km("2公里"), 2.0)  # km wins over 米 in 公里
+
+    def test_parse_radius_no_match(self):
+        self.assertIsNone(server._parse_radius_km("附近有什么好玩的"))
+        self.assertIsNone(server._parse_radius_km(""))
+
+    def test_haversine_known_distance(self):
+        # 杭州 -> 上海 ~165km
+        distance = server._haversine_km(30.27, 120.15, 31.23, 121.47)
+        self.assertTrue(150 < distance < 185)
+
+    def test_dedupe_by_place_substring_collapse(self):
+        def cand(place, rank):
+            return {"_place": place, "ranking": rank}
+
+        ranked = [cand("龙溪草甸", 0.9), cand("龙溪草甸景区", 0.7), cand("千岛湖", 0.5)]
+        deduped = server._dedupe_by_place(ranked)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0]["_place"], "龙溪草甸")
+        self.assertEqual(deduped[0]["mentions"], 2)
+
+    def test_dedupe_by_place_keeps_placeless_and_distinct(self):
+        ranked = [
+            {"_place": "", "ranking": 0.9},
+            {"_place": "甲山村", "ranking": 0.8},
+            {"_place": "乙湖", "ranking": 0.7},  # len<3 -> never deduped
+        ]
+        self.assertEqual(len(server._dedupe_by_place(ranked)), 3)
 
 
 class Issue7PublicUrlTests(unittest.TestCase):
