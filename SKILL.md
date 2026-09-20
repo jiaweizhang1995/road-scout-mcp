@@ -1,7 +1,7 @@
 ---
 name: road-scout
 description: 周边旅行与本地发现。用户询问某地附近的小众景点、民宿、山野空间、本地体验、吃饭去处，或要求寻找与某个参考地点相似的地方时使用。通过 road-scout MCP 只读检索小红书、B站、抖音、公开网页和高德美食榜，并用 Jev 评估第一手体验信号、营销倾向和本次偏好匹配。
-version: 1.5.0
+version: 1.6.0
 ---
 
 # road-scout 周边发现
@@ -42,7 +42,7 @@ version: 1.5.0
 返回语义：
 
 - `recommendations`：正式推荐，只包含 `supported` 或 `marketing_risk`。
-- `exploratory`：`insufficient`（证据不足）或 `out_of_range`（超距离），只能作为备选线索。
+- `exploratory`：包括 `insufficient`（证据不足），以及质量合格但 `out_of_range=true` 的超范围候选；都只能作为备选线索。
 - `filtered`：已被筛掉，不应重新放回推荐。
 - `food`：高德美食榜候选，仅在美食意图下使用。
 - `source_status` / `notes`：用于判断覆盖是否受影响，不必全部展示给用户。
