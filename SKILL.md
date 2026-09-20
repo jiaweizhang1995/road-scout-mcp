@@ -18,86 +18,38 @@ version: 1.4.1
 
 ## 工具选择
 
-### 1. `nearby_discover`：当前位置的首选入口
+### 1. `road_scout_recommend`：首选高层入口
 
-传入：`latitude`、`longitude`、`area_name`、`radius_km`、`categories`、`preferences`；需要提示最终展示数量时再传 `max_results`。
+用户问“附近去哪、小众景点、民宿、像某地这样的地方、吃什么”时，直接调用这一个工具。它内部完成：少量查询 → 多源搜索 → 去重 → 读小红书正文 → Jev 筛选 → 必要时补评论/补搜 → 输出正式推荐和备选线索。不要把返回结果再拼一层 raw evidence。
 
-建议默认参数：
+传入：
 
-- `radius_km`: 80–120；用户说“附近”但没有距离时使用 100。
-- `categories`: `["小众景点", "小众住宿", "本地体验"]`；若用户明确要吃饭，再加入 `"本地美食"`。
-- `preferences`: `["小众", "冷门", "人少", "真实体验", "适合自驾"]`。
+- `request`：用户原话，例如“杭州附近100公里小众自驾”“想找安静人少的民宿”。
+- `area_name`：地点锚点（城市/景区/地名）。有定位时传城市名；用户问“像某地”时传该地所属区域或把地名留在 request 里。没有地点信息时先向用户要，不要猜。
+- `categories`：默认 `["山野", "民宿", "本地体验"]`，可按需求覆盖。
+- `preferences`：默认小众、人少、本地体验、适合自驾；用户显式偏好优先。
+- `include_food`：用户明确问吃饭/餐馆/美食时传 true（request 含“吃/餐/美食/饭”会自动触发）。
+- `max_results`：正式推荐上限，默认 5；候选不够好时返回更少，不凑数。
 
-工具内部会按每个分类召回：小红书 15 条、B站 12 条、抖音 10 条、网页 12 条，并附带高德美食榜最多 20 家。`max_results` 不会改变各平台的召回条数；仍需在去重、评论补充和 Jev 精排后控制最终展示数量。
+返回 `recommendations`（supported / marketing_risk，含 reason、Jev 信号、key_evidence、risks、原始链接）、`exploratory`（证据不足的备选线索）、`food`（高德榜，仅问吃饭时）、`source_status`、`notes`。filtered 候选不会出现在推荐里。
 
-当前位置优先使用手机定位提供的经纬度和城市名。若没有定位，先向用户要城市或位置，不要猜测。
+### 2. 低层工具：调试、补查、用户点名平台时用
 
-### 2. `social_search`：参考地点或补充搜索
-
-用户提到参考地点（例如“像甘露别院一样”）时，至少执行两组查询：
-
-1. 参考地点名称 + 城市/区域 + 真实体验
-2. 参考地点名称 + 类似 + 小众 + 冷门 + 自驾
-
-不要自动加入“禅意”等风格词，除非用户明确表达了这种偏好。对小红书搜索使用 `sources=["xiaohongshu"]`；需要交叉验证时再加入 `bilibili` 或 `web`。
-
-### 3. `gaode_food_ranking`：吃饭推荐
-
-只要用户询问吃什么、去哪吃、附近餐馆，优先调用 `gaode_food_ranking(city_name)`。默认取 20 家，再结合距离、营业状态、停车和路线筛选；不要用普通网页搜索结果替代高德榜单。
-
-高德结果是榜单候选，不代表当前营业或一定适合用户；需要提醒用户出发前确认营业时间、排队和停车。
-
-### 4. `douyin_search`：近期视频补充
-
-用户要求近期视频、现场氛围或短视频线索时，调用 `douyin_search`。抖音营销和团购内容较多，必须交给 Jev 降权，不能单独作为真实体验证明。
-
-### 5. `xiaohongshu_note`：读取正文
-
-对去重后的每个小红书候选调用 `xiaohongshu_note(note_url)`。`note_url` 必须直接使用 search 返回的完整 signed URL（包括 `xsec_token`）；不要从 note ID 重建 URL，也不要伪造 token。
-
-工具返回可直接交给 Jev 的候选对象，保留原始 `url`、正文 `text`、标题、作者和互动字段。正文读取失败时保留空 `text` 并标记不可用，不能把标题当正文，也不要把读取失败解释成负面评价。
-
-### 6. 评论区证据
-
-- 对进入候选集的前 10 条小红书笔记，调用 `xiaohongshu_comments(note_url, limit=20, with_replies=true)`；若候选不足 10 条，则全部调用。
-- 优先拉取高匹配但信息不完整、评论出现争议、或需要核验交通/停车/门票的笔记；不要对所有召回结果无差别拉评论，以免变慢或触发平台限制。
-- 将评论单独标为 `comment_evidence`，保留作者、点赞、时间、是否回复和原帖链接。评论中的具体限制、缺点和相互印证比单纯“好美”更有价值。
-- 抖音当前 OpenCLI 只提供 `douyin_creator_comments(sec_uid, limit=5, comment_limit=10)`，返回创作者近期视频的 `top_comments`。`douyin_search` 的搜索结果没有可靠 `sec_uid`，也没有直接按任意视频 URL 拉评论的命令；无法获得 `sec_uid` 时明确标记“抖音评论未拉取”，不要猜测或伪造。
-- 抖音评论同样要交给 Jev 降权营销、团购和商家自营内容，并优先采用包含具体路线、价格、排队、停车或踩坑的评论。
-
-### 7. `jev_rank_candidates`：证据判断与精排
-
-先合并、去重候选，再传入最多 12 个最有价值的候选。每个候选尽量包含：名称、来源、原始链接、作者、点赞/收藏、发布时间、Issue #3 读取的原始正文和必要的 `comment_evidence`。不要用 Agent 自己写的推荐理由或摘要替代正文。
-
-Jev 只做三个判断：
-
-- `firsthand`：正文是否有路线、时间、停车、价格、现场情况、优缺点或踩坑等第一手体验细节；这不是作者身份认证。
-- `marketing`：是否有团购、私信、购买链接、联系方式、商家自营或模板导流。合作内容如果仍有具体体验，可以保留但降低权重。
-- `fit`：正文是否符合本次用户偏好。用户显式偏好优先，默认小众、人少、自驾只在没有显式偏好时使用。
-
-正文缺失、过短或 `body_status != ok` 时标记“证据不足”，不要强行判成低质量。
-
-让 Jev 判断：
-
-- 是否像作者亲自到访后的第一手体验
-- 是否存在营销、导流、旅行社或商家自营倾向
-- 是否符合小众、安静、人少、真实体验和自驾偏好
-
-不要把 Jev 概率当成事实证明；它是排序信号。
-
-### 8. `road_scout_status`
-
-只在首次使用、调用失败或用户要求诊断时调用。不要把完整 doctor 输出直接展示给用户，只提炼可操作的故障原因。
+- `social_search(query, sources, limit)`：多源搜索原始结果；`nearby_discover` 是按分类批量收集 evidence 的旧入口，用途相同但更底层。
+- `xiaohongshu_note(note_url)`：读取单篇小红书正文；`note_url` 必须是 search 返回的完整 signed URL（含 `xsec_token`），不要从 note ID 重建。
+- `xiaohongshu_comments(note_url, limit, with_replies)`：需要核验停车/门票/排队/争议时少量补评论，不要对全部召回无差别拉取。
+- `douyin_search(query)` / `douyin_creator_comments(sec_uid, ...)`：近期视频补充；没有 `sec_uid` 时明确标记评论未拉取。
+- `jev_rank_candidates(candidates, user_preferences)`：对手动收集的候选跑 Jev 三维判断（firsthand / marketing / fit）；正文缺失标记 insufficient，不强行判低质。
+- `gaode_food_ranking(city_name)`：吃饭推荐的高德榜单候选；名次不代表实时营业，提醒用户确认营业、排队和停车。
+- `road_scout_status`：首次使用、调用失败或用户要求诊断时用，只提炼可操作的故障原因。
 
 ## 推荐流程
 
-1. 获取当前位置和城市名。
-2. 调用 `nearby_discover` 或 `social_search` 获取小红书候选。
-3. 按 note 身份去重候选，保留第一次 search 返回的完整 signed URL。
-4. 对去重后的候选调用 `xiaohongshu_note` 读取正文。
-5. 按需补充少量 `xiaohongshu_comments`；评论不是每条候选都必须拉取。
-6. 将正文和其他原始字段交给 `jev_rank_candidates` 精排，不让 Agent 自己生成的摘要替代正文。
-7. 输出 3–6 个推荐；吃饭单独列出高德榜候选。
+1. 确定地点锚点（定位城市名或用户提到的地名）和需求描述。
+2. 调用 `road_scout_recommend`；问吃饭时确保 `area_name` 有值。
+3. 检查 `source_status` 和 `notes`，向用户说明失败的来源。
+4. 输出 `recommendations` 为主，`exploratory` 单独标为备选线索；吃饭候选看 `food`。
+5. 仅当用户追问细节或某个候选需要核验时，再用低层工具补查。
 
 ## 输出要求
 
