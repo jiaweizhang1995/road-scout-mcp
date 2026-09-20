@@ -1302,16 +1302,25 @@ def _comment_texts(raw: dict[str, Any]) -> list[str]:
 
 
 _PLACE_SUFFIX = "山顶|山|湖|村|镇|民宿|营地|景区|公园|古道|瀑布|溪谷|峡谷|草甸|农庄|水库|岛|溪|寺|桥|湾"
-# Generic verbs/prepositions that lead note phrases ("沿着山脊" -> 山) but never
-# start a real place name in this corpus; stripped before use.
-_PLACE_STRIP_PREFIX = "沿枕住藏躺在去到看玩来走爬逛向离约"
-# Modal/aspect particles that no place name contains; presence means the token
-# is a sentence fragment, not a place ("正的避世民宿").
-_PLACE_BAD_CHARS = "的着了呢吗吧啊哦呀嘛地被得"
+# Explicit phrase prefixes seen in note bodies ("沿着山脊", "住在山边"); only
+# whole phrases are stripped, never character sets, so 藏马山 stays 藏马山.
+_PLACE_NOISE_PREFIXES = (
+    "沿着", "枕着", "住在", "住进", "来到", "去了", "到达", "位于",
+    "打卡", "藏在", "途经", "经过", "导航到", "走进", "逛到",
+)
+# Modal/aspect particles: a token containing one is a sentence fragment, not a
+# place ("正的避世民宿"). They also can never lead a name, so leading ones are
+# stripped. 地 is deliberately absent — real names like 西溪湿地公园 need it.
+_PLACE_BAD_CHARS = "的着了呢吗吧啊哦呀嘛被"
 
 
 def _clean_place(place: str) -> str:
-    place = place.lstrip(_PLACE_STRIP_PREFIX)
+    """Clean a text-field place token; title tokens are returned untouched."""
+    place = place.lstrip(_PLACE_BAD_CHARS)
+    for prefix in _PLACE_NOISE_PREFIXES:
+        if place.startswith(prefix):
+            place = place[len(prefix):]
+            break
     if len(place) < 2 or any(char in place for char in _PLACE_BAD_CHARS):
         return ""
     return place
@@ -1321,8 +1330,9 @@ def _extract_place(candidate: dict[str, Any]) -> str:
     """Best-effort place token: longest suffix span in the first place-like run.
 
     A confident title match (suffix within the first few chars of a run) wins
-    outright; a title fallback beats any text-field hit so sentence fragments
-    like "沿着山脊" cannot override a real title place.
+    outright and is returned verbatim — real names must never be mangled. A
+    title fallback beats any text-field hit so sentence fragments like
+    "沿着山脊" cannot override a real title place.
     """
     fallback = ""
     for field_index, field in enumerate((candidate.get("title"), candidate.get("text"))):
@@ -1333,8 +1343,9 @@ def _extract_place(candidate: dict[str, Any]) -> str:
             if not matches:
                 continue
             first, last = matches[0], matches[-1]
-            place = _clean_place(run[max(0, last.start() - 4) : last.end()])
-            if not place:
+            raw = run[max(0, last.start() - 4) : last.end()]
+            place = raw if field_index == 0 else _clean_place(raw)
+            if len(place) < 2:
                 continue
             if first.start() <= 3 and (field_index == 0 or not fallback):
                 return place

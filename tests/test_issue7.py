@@ -561,6 +561,28 @@ class Issue7GeoTests(unittest.TestCase):
     def test_wgs84_to_gcj02_noop_outside_china(self):
         self.assertEqual(server._wgs84_to_gcj02(51.5, -0.12), (51.5, -0.12))
 
+    def test_extract_place_never_rewrites_real_names(self):
+        # 藏马山 must stay 藏马山 (char-level stripping would produce 马山 and
+        # could match an unrelated POI); 西溪湿地公园 must not be emptied by
+        # the bad-char filter (地 is a legitimate name character).
+        self.assertEqual(
+            server._extract_place({"title": "藏马山徒步攻略", "text": ""}), "藏马山"
+        )
+        self.assertEqual(
+            server._extract_place({"title": "西溪湿地公园", "text": ""}), "西溪湿地公园"
+        )
+
+    def test_extract_place_text_fragments_rejected(self):
+        # sentence fragments in the body are not place names
+        self.assertEqual(
+            server._extract_place({"title": "随便逛逛", "text": "沿着山脊走了很久"}), ""
+        )
+        # but a real place in the body still surfaces when the title has none
+        self.assertEqual(
+            server._extract_place({"title": "周末出游", "text": "去了西溪湿地公园，人少安静"}),
+            "西溪湿地公园",
+        )
+
 
 class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
