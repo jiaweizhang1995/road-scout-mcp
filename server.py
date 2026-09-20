@@ -40,6 +40,8 @@ MAX_QUERY_LENGTH = 500
 DEFAULT_SOURCES = ("xiaohongshu", "bilibili", "web")
 SUCCESS_STATUSES = {"ok", "empty", "partial"}
 FAILURE_STATUSES = {"unavailable", "parse_error"}
+DEFAULT_USER_PREFERENCES = ("小众", "人少", "本地体验", "适合自驾")
+MIN_JEV_TEXT_LENGTH = 20
 
 mcp = FastMCP(
     "road-scout",
@@ -806,50 +808,188 @@ async def nearby_discover(
     }
 
 
-@mcp.tool()
-async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences: list[str] | None = None) -> dict[str, Any]:
-    """Score candidate evidence with Jev without generating or executing actions.
+def _candidate_text_for_jev(candidate: dict[str, Any]) -> str:
+    text = candidate.get("text")
+    if not isinstance(text, str):
+        text = ""
+    comment_evidence = candidate.get("comments")
+    if isinstance(comment_evidence, list):
+        comment_text = "\n".join(
+            str(item.get("text", item)) if isinstance(item, dict) else str(item)
+            for item in comment_evidence
+        ).strip()
+        if comment_text:
+            return f"{text.strip()}\n评论证据：{comment_text}".strip()
+    return text.strip()
 
-    Each candidate should include a name and evidence text.  The returned
-    probabilities are signals, not proof that a creator is a real user.
-    """
-    api_key = os.getenv("TYPESAFE_API_KEY")
-    if not api_key:
-        return {"ok": False, "error": "TYPESAFE_API_KEY is not configured", "candidates": candidates}
-    if not candidates:
-        return {"ok": True, "answers": {}}
-    candidates = candidates[:12]
-    preferences = user_preferences or ["小众", "人少", "本地体验", "适合自驾"]
-    state = {"preferences": preferences, "candidates": candidates}
+
+def candidate_has_sufficient_evidence(candidate: dict[str, Any]) -> bool:
+    if candidate.get("body_status") not in (None, "ok"):
+        return False
+    return len(_candidate_text_for_jev(candidate)) >= MIN_JEV_TEXT_LENGTH
+
+
+def _jev_candidate_state(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Pass source evidence to Jev without replacing it with an agent summary."""
+    return {
+        key: candidate.get(key)
+        for key in (
+            "candidate_id",
+            "title",
+            "source",
+            "url",
+            "author",
+            "text",
+            "comments",
+            "likes",
+            "collects",
+            "published_at",
+        )
+    }
+
+
+def build_jev_payload(
+    candidates: list[dict[str, Any]], preferences: list[str]
+) -> tuple[dict[str, Any], dict[str, int]]:
+    state_candidates = [_jev_candidate_state(candidate) for candidate in candidates]
+    state = {"user_preferences": preferences, "candidates": state_candidates}
     questions: dict[str, Any] = {}
+    eligible: dict[str, int] = {}
+    preference_text = "、".join(preferences) if preferences else "没有额外偏好"
     for index, candidate in enumerate(candidates):
+        if not candidate_has_sufficient_evidence(candidate):
+            continue
+        eligible_id = str(candidate.get("candidate_id", index))
+        eligible[eligible_id] = index
         questions[f"candidate_{index}_firsthand"] = {
             "type": "noul",
-            "instructions": f"判断 candidates[{index}] 是否像作者亲自到访后写下的第一手体验，而不是广告、转载或模板化营销内容。",
+            "instructions": {
+                "question": "判断这段正文是否呈现明显的第一手体验，而不是判断作者身份是否已验证。",
+                "evidence": f"`candidates[{index}].text` 及必要的评论证据",
+            },
             "criteria": {
-                "true": "包含具体地点、路线、价格、时间、体验细节或真实缺点，能看出作者实际到访。",
-                "false": "主要是夸张形容、泛泛推荐、导流、带货、合作宣传或缺乏可核验细节。",
+                "true": "有具体路线、到达时间、停车、价格、排队、现场情况、天气路况、优缺点或踩坑等体验细节。",
+                "false": "只有泛泛形容、转载口吻、模板化推荐，缺少可核对的体验细节。",
             },
         }
         questions[f"candidate_{index}_marketing"] = {
             "type": "noul",
-            "instructions": f"判断 candidates[{index}] 是否有明显营销或商业推广倾向。",
+            "instructions": {
+                "question": "判断正文是否有明显营销、商业合作或导流倾向。商业合作本身不等于内容无价值。",
+                "evidence": f"`candidates[{index}].text` 及必要的评论证据",
+            },
             "criteria": {
-                "true": "出现广告/合作/团购/私信/购买链接、商务联系方式、统一宣传模板或强导流。",
-                "false": "没有明显商业导流，且同时包含具体体验、限制或负面信息。",
+                "true": "有团购、私信预订、购买链接、联系方式、商家自营、旅行社模板或明显夸张导流。",
+                "false": "没有明显导流，或虽有合作标记但正文仍以具体体验和限制为主。",
             },
         }
         questions[f"candidate_{index}_fit"] = {
             "type": "score",
-            "instructions": f"评价 candidates[{index}] 对用户偏好的匹配程度。",
+            "instructions": {
+                "question": "评价正文内容对本次用户偏好的匹配程度。只按当前用户偏好判断，不把默认偏好当成固定标准。",
+                "preferences": preference_text,
+                "evidence": f"`candidates[{index}].text` 及候选元数据",
+            },
             "criteria": [
-                "几乎不符合：热门、泛泛而谈或与自驾需求无关",
-                "部分符合：有一些相关信息，但缺少小众或路线细节",
-                "比较符合：有明确的本地体验和自驾价值",
-                "非常符合：冷门、少人、具体、可执行，且明显适合这次自驾",
+                "不符合当前偏好或缺乏可执行信息",
+                "部分符合当前偏好，但信息有限",
+                "较符合当前偏好，且有具体可执行信息",
+                "非常符合当前偏好，具体且有明确体验价值",
             ],
         }
-    payload = {"model": os.getenv("TYPESAFE_MODEL", "jev-latest"), "state": state, "questions": questions}
+    return {"model": os.getenv("TYPESAFE_MODEL", "jev-latest"), "state": state, "questions": questions}, eligible
+
+
+def _noul_value(answer: Any) -> float | None:
+    if not isinstance(answer, dict):
+        return None
+    value = answer.get("noul")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _score_value(answer: Any) -> float | None:
+    if not isinstance(answer, dict):
+        return None
+    value = answer.get("score")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def rank_jev_results(candidates: list[dict[str, Any]], answers: dict[str, Any]) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates):
+        result = dict(candidate)
+        candidate_key = f"candidate_{index}"
+        if not candidate_has_sufficient_evidence(candidate):
+            result.update(
+                {
+                    "firsthand": None,
+                    "marketing": None,
+                    "fit": None,
+                    "evidence_status": "insufficient",
+                    "ranking": -1.0,
+                    "reason": "正文信息不足，暂不进入正式推荐",
+                }
+            )
+            ranked.append(result)
+            continue
+        firsthand_answer = answers.get(f"{candidate_key}_firsthand")
+        marketing_answer = answers.get(f"{candidate_key}_marketing")
+        fit_answer = answers.get(f"{candidate_key}_fit")
+        firsthand = _noul_value(firsthand_answer)
+        marketing = _noul_value(marketing_answer)
+        fit = _score_value(fit_answer)
+        if firsthand is None or marketing is None or fit is None:
+            result.update(
+                {
+                    "firsthand": firsthand_answer,
+                    "marketing": marketing_answer,
+                    "fit": fit_answer,
+                    "evidence_status": "insufficient",
+                    "ranking": -1.0,
+                    "reason": "Jev 未返回完整判断，证据待补查",
+                }
+            )
+            ranked.append(result)
+            continue
+        ranking = round((fit / 3.0) * 0.55 + firsthand * 0.35 - marketing * 0.25, 4)
+        if marketing >= 0.75 and firsthand < 0.5:
+            status = "filtered"
+            ranking = min(ranking, -0.1)
+            reason = "营销倾向明显且缺少第一手细节"
+        elif marketing >= 0.65 and firsthand >= 0.5:
+            status = "marketing_risk"
+            reason = "营销倾向较高，但正文仍有具体体验信息"
+        else:
+            status = "supported"
+            reason = "第一手体验细节丰富，偏好匹配较高" if fit >= 2.0 and firsthand >= 0.65 else "有部分第一手体验支持"
+        result.update(
+            {
+                "firsthand": firsthand_answer,
+                "marketing": marketing_answer,
+                "fit": fit_answer,
+                "evidence_status": status,
+                "ranking": ranking,
+                "reason": reason,
+            }
+        )
+        ranked.append(result)
+    return sorted(ranked, key=lambda item: item["ranking"], reverse=True)
+
+
+@mcp.tool()
+async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences: list[str] | None = None) -> dict[str, Any]:
+    """Judge firsthand evidence, marketing tendency, and preference fit with Jev."""
+    api_key = os.getenv("TYPESAFE_API_KEY")
+    if not api_key:
+        return {"ok": False, "error": "TYPESAFE_API_KEY is not configured", "candidates": candidates}
+    if not candidates:
+        return {"ok": True, "answers": {}, "results": []}
+    candidates = candidates[:12]
+    preferences = list(DEFAULT_USER_PREFERENCES if user_preferences is None else user_preferences)
+    payload, eligible = build_jev_payload(candidates, preferences)
+    if not eligible:
+        results = rank_jev_results(candidates, {})
+        return {"ok": True, "answers": {}, "results": results, "candidates": results, "model": payload["model"]}
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
@@ -858,7 +998,10 @@ async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences
                 json=payload,
             )
             response.raise_for_status()
-            return {"ok": True, "answers": response.json().get("answers", {}), "model": payload["model"]}
+            body = response.json()
+            answers = body.get("answers", {}) if isinstance(body, dict) else {}
+            results = rank_jev_results(candidates, answers)
+            return {"ok": True, "answers": answers, "results": results, "candidates": results, "model": body.get("model", payload["model"])}
     except Exception as exc:  # keep the MCP tool useful when the service is unavailable
         return {"ok": False, "error": str(exc), "candidates": candidates}
 
