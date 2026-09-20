@@ -68,7 +68,7 @@ GEO_TIMEOUT = 15
 # Per-provider minimum interval between requests: Nominatim's public-service
 # policy is a hard 1 req/s; Amap personal keys rate-limit near 3 QPS and
 # silently drop bursts, so calls are spaced to stay comfortably under it.
-GEO_MIN_INTERVAL = {"nominatim": 1.0, "amap": 0.4}
+GEO_MIN_INTERVAL = {"nominatim": 1.0, "amap": 0.5}
 _last_geo_call: dict[str, float] = {}
 
 
@@ -1347,7 +1347,10 @@ def _extract_place(candidate: dict[str, Any]) -> str:
             place = raw if field_index == 0 else _clean_place(raw)
             if len(place) < 2:
                 continue
-            if first.start() <= 3 and (field_index == 0 or not fallback):
+            # Confident only when nothing better seen yet: an earlier fallback
+            # (e.g. title run "永泰白杜民宿") beats a later run's early suffix
+            # hit (e.g. "推门见山"), which is usually a phrase, not a place.
+            if first.start() <= 3 and not fallback:
                 return place
             if not fallback:
                 fallback = place
@@ -1543,20 +1546,25 @@ async def geocode_area(area: str) -> tuple[float, float, str] | None:
     return await _nominatim_geocode(area, must_contain=(area,))
 
 
+# Amap geocode degrades to progressively coarser matches; a city-or-coarser
+# hit means the place itself was not found and the returned coords are just
+# the area centroid — treat as unknown rather than a wrong near distance.
+# The API returns short forms (市, 区县) so both spellings are covered.
+_COARSE_GEOCODE_LEVELS = {"国家", "省", "省份", "市", "城市", "区县", "县", "区", "开发区"}
+
+
 async def geocode_place(place: str, area: str) -> tuple[float, float, str] | None:
-    """Resolve one candidate place. Returns (lat, lon, label)."""
+    """Turn a discovered place name into approximate coordinates."""
     if AMAP_API_KEY:
+        address = f"{area}{place}" if area else place
         body = await _amap_get(
-            "/v3/place/text",
-            {"keywords": place, "city": area or "", "citylimit": "true" if area else "false"},
+            "/v3/geocode/geo", {"address": address, "city": area or ""}
         )
-        pois = (body or {}).get("pois") or []
-        point = _split_lng_lat(pois[0].get("location")) if pois else None
-        name = str(pois[0].get("name") or "") if pois else ""
-        # Amap fuzzy-matches aggressively; only trust a POI whose name shares
-        # the queried place, otherwise report unknown instead of a wrong fix.
-        if point and (place in name or (len(name) >= 3 and name in place)):
-            return point[0], point[1], name
+        codes = (body or {}).get("geocodes") or []
+        code = codes[0] if codes else {}
+        point = _split_lng_lat(code.get("location"))
+        if point and code.get("level") not in _COARSE_GEOCODE_LEVELS:
+            return point[0], point[1], str(code.get("formatted_address") or address)
         return None
     return await _nominatim_geocode(f"{place} {area}".strip(), must_contain=(place,))
 

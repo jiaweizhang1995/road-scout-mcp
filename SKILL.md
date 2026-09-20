@@ -30,12 +30,13 @@ version: 1.5.0
 - `include_food`：包含吃饭需求时设为 true。
 - `max_results`：正式推荐上限，默认 5。候选不够好时返回更少，不凑数。
 - `radius_km`：距离上限（公里）。不传时会尝试从 `request` 解析“附近X公里/X米”；显式传参优先于文本解析。
-- `latitude` / `longitude`：起点坐标，需成对提供，按 WGS-84 传入（配置了 `AMAP_API_KEY` 时服务端自动转 GCJ-02 对齐高德 POI）。缺省用 `area_name` 地理编码（配置了 `AMAP_API_KEY` 走高德，否则 Nominatim）。
+- `latitude` / `longitude`：起点坐标，需成对提供，按 WGS-84 传入（配置了 `AMAP_API_KEY` 时服务端自动转 GCJ-02 对齐高德坐标）。缺省用 `area_name` 地理编码（配置了 `AMAP_API_KEY` 走高德 `geocode/geo`，否则 Nominatim）。
 
 距离语义：
 
-- 每条推荐带 `distance_km`；超出半径的候选降级到 `exploratory` 并在 `risks` 里标注距离。
-- 地点无法地理编码时 `distance_km` 为 `null` 并标“距离未知”，不会因为算不出距离被误删。
+- `distance_km` 是候选地点到起点的**大致直线距离**，只用于范围筛选，不代表实际驾车里程。
+- 高德只是把地点名地理编码成大致坐标；小众地点可能识别不出。
+- 超出半径的候选降级到 `exploratory` 并在 `risks` 里标注距离；解析不出坐标的 `distance_km` 为 `null` 并标“距离未知”，不会被误删。
 - 多条笔记指向同一地点时合并为一条，`mentions` 记录被合并的笔记数。
 
 返回语义：

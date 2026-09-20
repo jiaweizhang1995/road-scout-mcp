@@ -645,7 +645,7 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
             server.httpx, "AsyncClient", return_value=FlakyClient()
         ), patch("asyncio.sleep", new=AsyncMock()):
-            body = await server._amap_get("/v3/place/text", {})
+            body = await server._amap_get("/v3/geocode/geo", {})
         self.assertEqual(len(calls), 2)  # transient failure retried once
         self.assertEqual(body["status"], "1")
 
@@ -658,7 +658,7 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
             server.httpx, "AsyncClient", return_value=OkClient()
         ), patch("asyncio.sleep", new=AsyncMock()):
-            body = await server._amap_get("/v3/place/text", {})
+            body = await server._amap_get("/v3/geocode/geo", {})
         self.assertEqual(body["pois"][0]["name"], "鼓山")
         self.assertEqual(len(calls), 1)
 
@@ -674,24 +674,90 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
             lat, lon, _ = await server._resolve_origin(30.27, 120.15, "")
         self.assertEqual((lat, lon), (30.27, 120.15))
 
-    async def test_amap_fuzzy_mismatch_rejected(self):
-        body = {
-            "status": "1",
-            "pois": [{"name": "磨溪景区", "location": "119.413575,26.051775"}],
-        }
-        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
-            server, "_amap_get", new=AsyncMock(return_value=body)
-        ):
-            # "龙溪草甸" must not silently become the unrelated 磨溪景区
-            self.assertIsNone(await server.geocode_place("龙溪草甸", "福州"))
+    async def test_amap_geocode_uses_geo_endpoint(self):
+        calls = []
 
-        body["pois"] = [{"name": "福州市鼓山旅游景区", "location": "119.375610,26.053221"}]
+        async def spy(path, params):
+            calls.append((path, params))
+            return {
+                "status": "1",
+                "geocodes": [
+                    {
+                        "location": "119.348260,26.076930",
+                        "formatted_address": "福建省福州市晋安区鼓山",
+                        "level": "兴趣点",
+                    }
+                ],
+            }
+
         with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
-            server, "_amap_get", new=AsyncMock(return_value=body)
+            server, "_amap_get", new=AsyncMock(side_effect=spy)
         ):
             result = await server.geocode_place("鼓山", "福州")
+        self.assertEqual(calls[0][0], "/v3/geocode/geo")
+        self.assertEqual(calls[0][1]["address"], "福州鼓山")
+        self.assertEqual(calls[0][1]["city"], "福州")
+        self.assertEqual(result[:2], (26.07693, 119.34826))
+        self.assertEqual(result[2], "福建省福州市晋安区鼓山")
+
+    async def test_amap_geocode_no_result_returns_none(self):
+        async def spy(path, params):
+            return {"status": "1", "geocodes": []}
+
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server, "_amap_get", new=AsyncMock(side_effect=spy)
+        ):
+            self.assertIsNone(await server.geocode_place("狂蟒潭", "福州"))
+
+    async def test_amap_geocode_coarse_level_is_unknown(self):
+        # Amap degrades unfound places to the area centroid (short-form level
+        # like 市) — that would produce a wrongly small distance, so unknown.
+        async def spy(path, params):
+            return {
+                "status": "1",
+                "geocodes": [
+                    {
+                        "location": "119.296411,26.074286",
+                        "formatted_address": "福建省福州市",
+                        "level": "市",
+                    }
+                ],
+            }
+
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server, "_amap_get", new=AsyncMock(side_effect=spy)
+        ):
+            self.assertIsNone(await server.geocode_place("狂蟒潭", "福州"))
+
+    async def test_amap_geocode_village_level_accepted(self):
+        async def spy(path, params):
+            return {
+                "status": "1",
+                "geocodes": [
+                    {
+                        "location": "118.655211,25.778270",
+                        "formatted_address": "福建省福州市永泰县白杜村",
+                        "level": "村庄",
+                    }
+                ],
+            }
+
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server, "_amap_get", new=AsyncMock(side_effect=spy)
+        ):
+            result = await server.geocode_place("永泰白杜", "福州")
         self.assertIsNotNone(result)
-        self.assertEqual(result[2], "福州市鼓山旅游景区")
+        self.assertAlmostEqual(result[0], 25.77827)
+
+    def test_extract_place_title_fallback_beats_later_confident_run(self):
+        # "永泰白杜民宿" (fallback in first title run) must beat the phrase
+        # "推门见山" that matches confidently in a later run.
+        self.assertEqual(
+            server._extract_place(
+                {"title": "永泰白杜民宿｜推门见山，闭眼听溪", "text": ""}
+            ),
+            "永泰白杜民宿",
+        )
 
 
 class Issue7PublicUrlTests(unittest.TestCase):
