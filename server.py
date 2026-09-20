@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
+import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
@@ -60,6 +62,11 @@ PRACTICAL_KEYWORDS = (
 EVIDENCE_KEYWORDS = PRACTICAL_KEYWORDS + (
     "路线", "公里", "小时", "分钟", "信号", "人多", "人少", "导航", "泥", "滑",
 )
+AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_MIN_INTERVAL = 1.0  # OSMF public-service policy: at most 1 req/s
+GEO_TIMEOUT = 15
+_last_nominatim_call = 0.0
 
 mcp = FastMCP(
     "road-scout",
@@ -1288,17 +1295,18 @@ _PLACE_SUFFIX = "山顶|山|湖|村|镇|民宿|营地|景区|公园|古道|瀑�
 
 
 def _extract_place(candidate: dict[str, Any]) -> str:
-    """Best-effort place token for one targeted follow-up query."""
+    """Best-effort place token: longest suffix span in the first place-like run."""
     fallback = ""
     for field in (candidate.get("title"), candidate.get("text")):
         if not isinstance(field, str):
             continue
         for run in re.findall(r"[一-鿿]{2,}", field):
-            match = re.search(_PLACE_SUFFIX, run)
-            if not match:
+            matches = list(re.finditer(_PLACE_SUFFIX, run))
+            if not matches:
                 continue
-            place = run[max(0, match.start() - 4) : match.end()]
-            if match.start() <= 3:
+            first, last = matches[0], matches[-1]
+            place = run[max(0, last.start() - 4) : last.end()]
+            if first.start() <= 3:
                 return place
             if not fallback:
                 fallback = place
@@ -1325,6 +1333,8 @@ def _followup_targets(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if status == "insufficient" and candidate.get("body_status") == "unavailable":
             continue  # comments alone cannot rescue a missing body
+        if candidate.get("out_of_range"):
+            continue  # not worth a follow-up call when it exceeds the distance limit
         if candidate.get("source") == "xiaohongshu" or _extract_place(candidate):
             targets.append(candidate)
     return targets
@@ -1384,6 +1394,10 @@ def _risks_for(candidate: dict[str, Any]) -> list[str]:
         risks.append("仅搜索摘要，未读取正文")
     if candidate.get("comment_evidence"):
         risks.append("部分信息来自评论或补搜，可能已变化")
+    if candidate.get("out_of_range"):
+        risks.append(f"距起点约 {candidate.get('distance_km')} 公里，超出约定范围")
+    elif candidate.get("distance_requested") and candidate.get("distance_km") is None:
+        risks.append("位置未能核实，距离未知")
     if not _has_practical_info(candidate):
         risks.append("缺少停车、门票等实用信息，出发前需自行核实")
     return risks
@@ -1396,6 +1410,8 @@ def _to_recommendation(candidate: dict[str, Any]) -> dict[str, Any]:
         "url": _public_url(candidate.get("url")),
         "reason": candidate.get("reason"),
         "evidence_status": candidate.get("evidence_status"),
+        "distance_km": candidate.get("distance_km"),
+        "mentions": candidate.get("mentions", 1),
         "firsthand": _noul_value(candidate.get("firsthand")),
         "marketing": _noul_value(candidate.get("marketing")),
         "fit": _score_value(candidate.get("fit")),
@@ -1418,6 +1434,203 @@ async def _safe_dispatch(query: str, sources: list[str], limit: int) -> dict[str
         }
 
 
+# --- Distance / place helpers ------------------------------------------------
+# Geocoding is best-effort: Amap when AMAP_API_KEY is configured, otherwise
+# Nominatim with a display-name sanity check.  Places that cannot be resolved
+# keep distance_km=None and are never filtered out on distance.
+
+
+def _parse_radius_km(request: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:公里|千米|km)", request, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:米|m)(?![a-zA-Z])", request, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) / 1000.0
+    return None
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+async def _amap_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        async with httpx.AsyncClient(timeout=GEO_TIMEOUT) as client:
+            response = await client.get(
+                f"https://restapi.amap.com{path}",
+                params={**params, "key": AMAP_API_KEY, "output": "json"},
+            )
+            body = response.json()
+        return body if isinstance(body, dict) and body.get("status") == "1" else None
+    except Exception:
+        return None
+
+
+def _split_lng_lat(location: Any) -> tuple[float, float] | None:
+    if not isinstance(location, str) or "," not in location:
+        return None
+    try:
+        lng, lat = location.split(",", 1)
+        return float(lat), float(lng)
+    except ValueError:
+        return None
+
+
+async def geocode_area(area: str) -> tuple[float, float, str] | None:
+    """Resolve the request's origin anchor. Returns (lat, lon, label)."""
+    if AMAP_API_KEY:
+        body = await _amap_get("/v3/geocode/geo", {"address": area})
+        codes = (body or {}).get("geocodes") or []
+        point = _split_lng_lat(codes[0].get("location")) if codes else None
+        if point:
+            return point[0], point[1], area
+        return None
+    return await _nominatim_geocode(area, must_contain=(area,))
+
+
+async def geocode_place(place: str, area: str) -> tuple[float, float, str] | None:
+    """Resolve one candidate place. Returns (lat, lon, label)."""
+    if AMAP_API_KEY:
+        body = await _amap_get(
+            "/v3/place/text",
+            {"keywords": place, "city": area or "", "citylimit": "true" if area else "false"},
+        )
+        pois = (body or {}).get("pois") or []
+        point = _split_lng_lat(pois[0].get("location")) if pois else None
+        if point:
+            return point[0], point[1], str(pois[0].get("name") or place)
+        return None
+    return await _nominatim_geocode(f"{place} {area}".strip(), must_contain=(place,))
+
+
+async def _nominatim_geocode(query: str, must_contain: tuple[str, ...]) -> tuple[float, float, str] | None:
+    global _last_nominatim_call
+    delay = NOMINATIM_MIN_INTERVAL - (time.monotonic() - _last_nominatim_call)
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _last_nominatim_call = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            timeout=GEO_TIMEOUT,
+            headers={"User-Agent": "road-scout/0.1 (personal nearby-search tool)"},
+        ) as client:
+            response = await client.get(
+                NOMINATIM_URL,
+                params={"q": query, "format": "json", "limit": 1, "accept-language": "zh"},
+            )
+            rows = response.json()
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    row = rows[0]
+    display = str(row.get("display_name") or "")
+    # Reject implausible matches (e.g. a bus stop in another city sharing a word).
+    if must_contain and not any(token and token in display for token in must_contain):
+        return None
+    try:
+        return float(row["lat"]), float(row["lon"]), display
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _gcj02_shift_lat(x: float, y: float) -> float:
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320.0 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _gcj02_shift_lon(x: float, y: float) -> float:
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def _wgs84_to_gcj02(lat: float, lon: float) -> tuple[float, float]:
+    """WGS-84 -> GCJ-02. Only applies inside China; elsewhere coords are unchanged."""
+    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
+        return lat, lon
+    a, ee = 6378245.0, 0.006693421622965943
+    dlat = _gcj02_shift_lat(lon - 105.0, lat - 35.0)
+    dlon = _gcj02_shift_lon(lon - 105.0, lat - 35.0)
+    radlat = math.radians(lat)
+    magic = 1 - ee * math.sin(radlat) ** 2
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * math.sqrt(magic)) * math.pi)
+    dlon = (dlon * 180.0) / (a / math.sqrt(magic) * math.cos(radlat) * math.pi)
+    return lat + dlat, lon + dlon
+
+
+async def _resolve_origin(
+    latitude: float | None, longitude: float | None, area: str
+) -> tuple[float, float, str] | None:
+    if latitude is not None and longitude is not None:
+        try:
+            lat, lon = float(latitude), float(longitude)
+        except (TypeError, ValueError):
+            return None
+        if AMAP_API_KEY:
+            # Caller coords are WGS-84; convert so they compare like-for-like
+            # with GCJ-02 POIs returned by the Amap API.
+            lat, lon = _wgs84_to_gcj02(lat, lon)
+        return lat, lon, "指定坐标"
+    if area:
+        return await geocode_area(area)
+    return None
+
+
+async def _annotate_distances(
+    candidates: list[dict[str, Any]], origin: tuple[float, float], area: str
+) -> None:
+    places = {c.get("_place") for c in candidates if c.get("_place")}
+    coords: dict[str, tuple[float, float, str] | None] = {}
+    for place in places:  # sequential: be polite to the free geocoder
+        coords[place] = await geocode_place(place, area)
+    for candidate in candidates:
+        geo = coords.get(candidate.get("_place") or "")
+        if geo:
+            candidate["distance_km"] = round(
+                _haversine_km(origin[0], origin[1], geo[0], geo[1]), 1
+            )
+            candidate["place_label"] = geo[2]
+        else:
+            candidate["distance_km"] = None
+
+
+def _place_key(candidate: dict[str, Any]) -> str | None:
+    place = re.sub(r"\s+", "", str(candidate.get("_place") or _extract_place(candidate) or ""))
+    return place if len(place) >= 3 else None
+
+
+def _dedupe_by_place(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse multiple notes about the same place; the best-ranked one wins."""
+    groups: list[tuple[str, dict[str, Any]]] = []
+    result: list[dict[str, Any]] = []
+    for candidate in ranked:
+        key = _place_key(candidate)
+        merged = False
+        if key:
+            for existing_key, kept in groups:
+                if key in existing_key or existing_key in key:
+                    kept["mentions"] = kept.get("mentions", 1) + 1
+                    merged = True
+                    break
+        if not merged:
+            if key:
+                groups.append((key, candidate))
+            result.append(candidate)
+    return result
+
+
 @mcp.tool()
 async def road_scout_recommend(
     request: str,
@@ -1426,6 +1639,9 @@ async def road_scout_recommend(
     preferences: list[str] | None = None,
     include_food: bool = False,
     max_results: int = 5,
+    radius_km: float | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
 ) -> dict[str, Any]:
     """One-call recommend: search -> dedupe -> read bodies -> Jev -> gap-fill -> output.
 
@@ -1433,6 +1649,13 @@ async def road_scout_recommend(
     anchors queries to a place; when empty, ``request`` is the anchor. Failed
     sources are skipped, never fatal. ``max_results`` caps formal
     recommendations; weaker leads land in ``exploratory`` instead of padding.
+
+    Distance constraints come from ``radius_km`` or phrases like "附近100公里"/
+    "500米" inside ``request`` (explicit ``radius_km`` wins). The origin is
+    ``latitude``/``longitude`` (WGS-84) when both are given, otherwise
+    ``area_name`` geocoded via Amap (AMAP_API_KEY) or Nominatim. Candidates
+    beyond the radius move to ``exploratory`` with their distance; unresolved
+    places keep ``distance_km=None`` and are never filtered out.
     """
     request = _validate_query(request)
     max_results = max(1, min(max_results, 12))
@@ -1444,8 +1667,15 @@ async def road_scout_recommend(
     queries = _recommend_queries(request, area, cats)
     notes: list[str] = []
 
-    per_query = await asyncio.gather(
-        *(_safe_dispatch(query, list(RECOMMEND_SOURCES), SEARCH_LIMIT_PER_SOURCE) for query in queries)
+    radius = radius_km if radius_km is not None else _parse_radius_km(request)
+    if radius is not None:
+        radius = max(0.1, min(float(radius), 1000.0))
+
+    per_query, origin = await asyncio.gather(
+        asyncio.gather(
+            *(_safe_dispatch(query, list(RECOMMEND_SOURCES), SEARCH_LIMIT_PER_SOURCE) for query in queries)
+        ),
+        _resolve_origin(latitude, longitude, area),
     )
     pool, source_status = _collect_candidates(per_query)
     for source, status in source_status.items():
@@ -1462,6 +1692,19 @@ async def road_scout_recommend(
             "recommendations": [],
             "exploratory": [],
             "food": None,
+            "geo": {
+                "origin": (
+                    {"latitude": origin[0], "longitude": origin[1], "label": origin[2]}
+                    if origin
+                    else None
+                ),
+                "radius_km": radius,
+                "provider": "amap" if AMAP_API_KEY else "nominatim",
+                "crs": "gcj02" if AMAP_API_KEY else "wgs84",
+                "attribution": (
+                    "© 高德地图" if AMAP_API_KEY else "© OpenStreetMap contributors (Nominatim)"
+                ),
+            },
             "source_status": source_status,
             "notes": notes,
             "stats": {"candidates": len(pool), "ranked": 0, "filtered": 0, "followups": 0},
@@ -1515,6 +1758,19 @@ async def road_scout_recommend(
         )
 
     ranked = restore_urls(ranked_result["results"])
+    for candidate in ranked:
+        candidate["_place"] = _extract_place(candidate)
+    ranked = _dedupe_by_place(ranked)
+
+    if origin:
+        await _annotate_distances(ranked, (origin[0], origin[1]), area)
+    elif radius:
+        notes.append("请求包含距离约束，但缺少可定位起点（area_name 或 lat/lon），未做距离过滤")
+    if origin and radius:
+        for candidate in ranked:
+            candidate["distance_requested"] = True
+            distance = candidate.get("distance_km")
+            candidate["out_of_range"] = distance is not None and distance > radius
 
     targets = _followup_targets(ranked)
     if targets:
@@ -1522,18 +1778,30 @@ async def road_scout_recommend(
         rerank = await jev_rank_candidates(targets, prefs)
         if rerank.get("ok"):
             updated = {item.get("candidate_id"): item for item in restore_urls(rerank["results"])}
-            ranked = [updated.get(candidate.get("candidate_id"), candidate) for candidate in ranked]
+            ranked = [
+                {**updated.get(candidate.get("candidate_id"), candidate),
+                 "distance_km": candidate.get("distance_km"),
+                 "distance_requested": candidate.get("distance_requested"),
+                 "out_of_range": candidate.get("out_of_range"),
+                 "mentions": candidate.get("mentions", 1),
+                 "_place": candidate.get("_place")}
+                for candidate in ranked
+            ]
             ranked.sort(key=lambda item: item.get("ranking", -1.0), reverse=True)
+
+    def recommendable(candidate: dict[str, Any]) -> bool:
+        return candidate.get("evidence_status") in ("supported", "marketing_risk")
 
     recommendations = [
         _to_recommendation(candidate)
         for candidate in ranked
-        if candidate.get("evidence_status") in ("supported", "marketing_risk")
+        if recommendable(candidate) and not candidate.get("out_of_range")
     ][:max_results]
     exploratory = [
         _to_recommendation(candidate)
         for candidate in ranked
-        if candidate.get("evidence_status") == "insufficient"
+        if (recommendable(candidate) and candidate.get("out_of_range"))
+        or candidate.get("evidence_status") == "insufficient"
     ][:MAX_EXPLORATORY]
     filtered = sum(1 for candidate in ranked if candidate.get("evidence_status") == "filtered")
 
@@ -1546,6 +1814,7 @@ async def road_scout_recommend(
             "ranked": len(selected),
             "filtered": filtered,
             "followups": len(targets),
+            "out_of_range": sum(1 for candidate in ranked if candidate.get("out_of_range")),
         },
     )
 
