@@ -64,9 +64,19 @@ EVIDENCE_KEYWORDS = PRACTICAL_KEYWORDS + (
 )
 AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_MIN_INTERVAL = 1.0  # OSMF public-service policy: at most 1 req/s
 GEO_TIMEOUT = 15
-_last_nominatim_call = 0.0
+# Per-provider minimum interval between requests: Nominatim's public-service
+# policy is a hard 1 req/s; Amap personal keys rate-limit near 3 QPS and
+# silently drop bursts, so calls are spaced to stay comfortably under it.
+GEO_MIN_INTERVAL = {"nominatim": 1.0, "amap": 0.4}
+_last_geo_call: dict[str, float] = {}
+
+
+async def _geo_throttle(provider: str) -> None:
+    delay = GEO_MIN_INTERVAL[provider] - (time.monotonic() - _last_geo_call.get(provider, 0.0))
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _last_geo_call[provider] = time.monotonic()
 
 mcp = FastMCP(
     "road-scout",
@@ -1480,16 +1490,24 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 async def _amap_get(path: str, params: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        async with httpx.AsyncClient(timeout=GEO_TIMEOUT) as client:
-            response = await client.get(
-                f"https://restapi.amap.com{path}",
-                params={**params, "key": AMAP_API_KEY, "output": "json"},
-            )
-            body = response.json()
-        return body if isinstance(body, dict) and body.get("status") == "1" else None
-    except Exception:
+    for _ in range(2):
+        await _geo_throttle("amap")
+        try:
+            async with httpx.AsyncClient(timeout=GEO_TIMEOUT) as client:
+                body = (
+                    await client.get(
+                        f"https://restapi.amap.com{path}",
+                        params={**params, "key": AMAP_API_KEY, "output": "json"},
+                    )
+                ).json()
+        except Exception:
+            continue  # transient network/parse failure; one retry is enough
+        if isinstance(body, dict) and body.get("status") == "1":
+            return body
+        if isinstance(body, dict) and body.get("infocode") == "10021":
+            continue  # QPS-limited; the throttle spaces the retry
         return None
+    return None
 
 
 def _split_lng_lat(location: Any) -> tuple[float, float] | None:
@@ -1533,11 +1551,7 @@ async def geocode_place(place: str, area: str) -> tuple[float, float, str] | Non
 
 
 async def _nominatim_geocode(query: str, must_contain: tuple[str, ...]) -> tuple[float, float, str] | None:
-    global _last_nominatim_call
-    delay = NOMINATIM_MIN_INTERVAL - (time.monotonic() - _last_nominatim_call)
-    if delay > 0:
-        await asyncio.sleep(delay)
-    _last_nominatim_call = time.monotonic()
+    await _geo_throttle("nominatim")
     try:
         async with httpx.AsyncClient(
             timeout=GEO_TIMEOUT,

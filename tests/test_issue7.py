@@ -564,10 +564,11 @@ class Issue7GeoTests(unittest.TestCase):
 
 class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self._saved_nominatim_ts = server._last_nominatim_call
+        self._saved_geo_ts = dict(server._last_geo_call)
 
     async def asyncTearDown(self):
-        server._last_nominatim_call = self._saved_nominatim_ts
+        server._last_geo_call.clear()
+        server._last_geo_call.update(self._saved_geo_ts)
 
     def _nominatim_client(self, rows):
         class Client:
@@ -583,7 +584,7 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
         return Client()
 
     async def test_nominatim_min_interval_enforced(self):
-        server._last_nominatim_call = time.monotonic()  # pretend a call just happened
+        server._last_geo_call["nominatim"] = time.monotonic()  # pretend a call just happened
         with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock, patch.object(
             server.httpx, "AsyncClient", return_value=self._nominatim_client([])
         ):
@@ -592,12 +593,52 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(sleep_mock.await_args.args[0], 0.5)
 
     async def test_nominatim_no_sleep_after_interval(self):
-        server._last_nominatim_call = 0.0  # long ago
+        server._last_geo_call.pop("nominatim", None)  # long ago
         with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock, patch.object(
             server.httpx, "AsyncClient", return_value=self._nominatim_client([])
         ):
             await server._nominatim_geocode("杭州", ("杭州",))
         sleep_mock.assert_not_awaited()
+
+    async def test_amap_retries_transient_failure(self):
+        calls = []
+
+        class FlakyClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+            async def get(self, url, params=None):
+                calls.append(url)
+                if len(calls) == 1:
+                    raise httpx_error()
+                return FakeResponse({"status": "1", "pois": []})
+
+        def httpx_error():
+            import httpx
+            return httpx.ConnectError("boom")
+
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server.httpx, "AsyncClient", return_value=FlakyClient()
+        ), patch("asyncio.sleep", new=AsyncMock()):
+            body = await server._amap_get("/v3/place/text", {})
+        self.assertEqual(len(calls), 2)  # transient failure retried once
+        self.assertEqual(body["status"], "1")
+
+        class OkClient(FlakyClient):
+            async def get(self, url, params=None):
+                calls.append(url)
+                return FakeResponse({"status": "1", "pois": [{"name": "鼓山", "location": "119.3,26.0"}]})
+
+        calls.clear()
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server.httpx, "AsyncClient", return_value=OkClient()
+        ), patch("asyncio.sleep", new=AsyncMock()):
+            body = await server._amap_get("/v3/place/text", {})
+        self.assertEqual(body["pois"][0]["name"], "鼓山")
+        self.assertEqual(len(calls), 1)
 
     async def test_explicit_origin_converted_to_gcj02_under_amap(self):
         with patch.object(server, "AMAP_API_KEY", "test-amap-key"):
