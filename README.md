@@ -33,6 +33,33 @@ No cookie is exported by this project. The MCP server invokes read-only
 OpenCLI commands, and it never exposes arbitrary shell execution or social
 write actions.
 
+## Search result contract
+
+`social_search` uses one source registry for direct searches and
+`nearby_discover`. `sources` omitted means `xiaohongshu`, `bilibili`, and
+`web`; an explicit empty list or an unknown source is a parameter error. Query
+whitespace is trimmed, queries must be 1–500 characters, and duplicate sources
+are de-duplicated in first-seen order. The supported source names are
+`xiaohongshu`, `bilibili`, `douyin`, and `web`.
+
+Each source result has a `status` of `ok`, `empty`, `partial`, `unavailable`, or
+`parse_error`, plus `source`, `data`, and a structured `error` when applicable.
+Adapters may explicitly return `status: "partial"`; the aggregate search status
+preserves that partial result for combinations with successful, empty, or failed
+sources. OpenCLI search results must be an array or a documented list wrapper;
+the Exa MCP result must contain MCP `content` blocks. Unexpected JSON shapes are
+reported as `parse_error`.
+The legacy boolean `ok` is retained for clients that still read it; it is true
+for `ok`, `empty`, and `partial`. A successful process with an MCP
+`isError: true` response is `unavailable`, while malformed JSON or a scalar
+JSON value is `parse_error`. Text commands such as `road_scout_status` keep
+their diagnostic text and are not forced through JSON parsing.
+
+The local Exa schema was inspected with `mcporter list exa --schema --json`.
+The redacted fixture is [docs/contracts/exa-web-search.schema.json](docs/contracts/exa-web-search.schema.json);
+the adapter sends only its confirmed `query`, `numResults`, and required
+`objective` fields.
+
 ## Open Minis configuration
 
 Use the Mac's Tailscale/private HTTPS address once configured:

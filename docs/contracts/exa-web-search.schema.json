@@ -1,0 +1,20 @@
+{
+  "captured_from": "mcporter list exa --schema --json",
+  "transport": "HTTP https://mcp.exa.ai/mcp",
+  "tool": "web_search_exa",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {"type": "string", "minLength": 1},
+      "numResults": {"type": "number"},
+      "objective": {"type": "string", "minLength": 1, "maxLength": 4096}
+    },
+    "required": ["query", "objective"],
+    "additionalProperties": false
+  },
+  "observed_at": "2026-09-20",
+  "notes": [
+    "This is a redacted contract fixture; it contains no credentials or search results.",
+    "The server preserves MCP content blocks in data and does not claim that text blocks are parsed search records."
+  ]
+}
