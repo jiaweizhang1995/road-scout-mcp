@@ -11,7 +11,7 @@ import asyncio
 import json
 import os
 import shutil
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -33,6 +33,9 @@ MCP_HOST = os.getenv("ROAD_SCOUT_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("ROAD_SCOUT_PORT", "18787"))
 MCP_TOKEN = os.getenv("ROAD_SCOUT_MCP_TOKEN", "")
 COMMAND_TIMEOUT = float(os.getenv("ROAD_SCOUT_COMMAND_TIMEOUT", "90"))
+MAX_QUERY_LENGTH = 500
+DEFAULT_SOURCES = ("xiaohongshu", "bilibili", "web")
+SUCCESS_STATUSES = {"ok", "empty", "partial"}
 
 mcp = FastMCP(
     "road-scout",
@@ -47,8 +50,17 @@ mcp = FastMCP(
 )
 
 
-async def run_command(*args: str, timeout: float = COMMAND_TIMEOUT) -> dict[str, Any]:
-    """Run one allow-listed local CLI command and parse JSON when possible."""
+async def run_command(
+    *args: str,
+    timeout: float = COMMAND_TIMEOUT,
+    expect_json: bool = False,
+) -> dict[str, Any]:
+    """Run one allow-listed command, keeping process and parse outcomes separate.
+
+    Text diagnostics (for example ``doctor``) are intentionally not parsed as
+    JSON. Search adapters pass ``expect_json=True`` so malformed JSON cannot be
+    reported as a successful search.
+    """
     proc = await asyncio.create_subprocess_exec(
         *args,
         stdout=asyncio.subprocess.PIPE,
@@ -60,23 +72,115 @@ async def run_command(*args: str, timeout: float = COMMAND_TIMEOUT) -> dict[str,
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        return {"ok": False, "error": "command_timeout", "command": list(args)}
+        return {
+            "ok": False,
+            "process_ok": False,
+            "exit_code": None,
+            "command": list(args),
+            "data": None,
+            "parse_error": None,
+            "error": {"code": "command_timeout", "message": "command timed out"},
+        }
 
     out = stdout.decode("utf-8", errors="replace").strip()
     err = stderr.decode("utf-8", errors="replace").strip()
     parsed: Any = out
+    parse_error: dict[str, Any] | None = None
     if out:
         try:
             parsed = json.loads(out)
         except json.JSONDecodeError:
-            pass
+            if expect_json:
+                parse_error = {"code": "invalid_json", "message": "stdout is not valid JSON"}
+    elif expect_json:
+        parse_error = {"code": "invalid_json", "message": "stdout is empty"}
+    process_ok = proc.returncode == 0
+    ok = process_ok and parse_error is None
     return {
-        "ok": proc.returncode == 0,
+        "ok": ok,
+        "process_ok": process_ok,
         "exit_code": proc.returncode,
         "command": list(args),
         "data": parsed,
+        "parse_error": parse_error,
         "stderr": err[-4000:] if err else None,
     }
+
+
+def _error(code: str, message: str, **details: Any) -> dict[str, Any]:
+    return {"code": code, "message": message, **details}
+
+
+def _data_is_empty(data: Any) -> bool:
+    if isinstance(data, list):
+        return not data
+    if isinstance(data, dict):
+        for key in ("results", "items", "data", "content"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return not value
+    return False
+
+
+def normalize_adapter_result(source: str, raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert a command/MCP response to the public source result contract."""
+    process_ok = raw.get("process_ok", raw.get("ok", False))
+    parse_error = raw.get("parse_error")
+    data = raw.get("data")
+    error = raw.get("error")
+    if not process_ok:
+        if not isinstance(error, dict):
+            error = _error(
+                "command_failed",
+                str(error) if error else "adapter process exited unsuccessfully",
+                exit_code=raw.get("exit_code"),
+            )
+        status = "unavailable"
+    elif parse_error:
+        status = "parse_error"
+        error = parse_error
+    elif isinstance(data, dict) and data.get("isError") is True:
+        status = "unavailable"
+        error = _error("mcp_is_error", "MCP tool reported a business failure", content=data.get("content"))
+    elif not isinstance(data, (dict, list)):
+        status = "parse_error"
+        error = _error("invalid_shape", "search adapter returned a non-object/non-array JSON value")
+    else:
+        status = "empty" if _data_is_empty(data) else "ok"
+        error = None
+    return {
+        "status": status,
+        "source": source,
+        "data": data,
+        "error": error,
+        # Compatibility for clients that only know the old boolean field.
+        "ok": status in SUCCESS_STATUSES,
+        "exit_code": raw.get("exit_code"),
+        "stderr": raw.get("stderr"),
+        "command": raw.get("command"),
+    }
+
+
+def _validate_query(query: str) -> str:
+    cleaned = query.strip()
+    if not cleaned:
+        raise ValueError("query must not be empty")
+    if len(cleaned) > MAX_QUERY_LENGTH:
+        raise ValueError(f"query must be at most {MAX_QUERY_LENGTH} characters")
+    return cleaned
+
+
+def _select_sources(sources: list[str] | None) -> list[str]:
+    if sources is None:
+        selected = list(DEFAULT_SOURCES)
+    elif not sources:
+        raise ValueError("sources must not be empty")
+    else:
+        selected = list(dict.fromkeys(sources))
+    unknown = [source for source in selected if source not in SOURCE_NAMES]
+    if unknown:
+        raise ValueError(f"unknown source: {unknown[0]}")
+    return selected
 
 
 async def search_xiaohongshu(query: str, limit: int) -> dict[str, Any]:
@@ -89,6 +193,7 @@ async def search_xiaohongshu(query: str, limit: int) -> dict[str, Any]:
         str(limit),
         "-f",
         "json",
+        expect_json=True,
     )
 
 
@@ -102,6 +207,7 @@ async def search_bilibili(query: str, limit: int) -> dict[str, Any]:
         str(limit),
         "-f",
         "json",
+        expect_json=True,
     )
 
 
@@ -115,6 +221,7 @@ async def search_douyin(query: str, limit: int) -> dict[str, Any]:
         str(limit),
         "-f",
         "json",
+        expect_json=True,
     )
 
 
@@ -131,6 +238,7 @@ async def fetch_xiaohongshu_comments(note_url: str, limit: int, with_replies: bo
         str(with_replies).lower(),
         "-f",
         "json",
+        expect_json=True,
     )
 
 
@@ -154,11 +262,23 @@ async def fetch_douyin_creator_comments(sec_uid: str, limit: int, comment_limit:
         str(comment_limit),
         "-f",
         "json",
+        expect_json=True,
     )
 
 
 async def search_web(query: str, limit: int) -> dict[str, Any]:
-    args = [
+    args = build_exa_search_args(query, limit)
+    return await run_command(*args, expect_json=True)
+
+
+def build_exa_search_args(query: str, limit: int) -> list[str]:
+    """Build arguments from the locally inspected Exa MCP contract.
+
+    The fixture in ``docs/contracts/exa-web-search.schema.json`` records the
+    schema observed on this machine.  Keep the MCP content blocks in ``data``;
+    parsing them into search records belongs to a later issue.
+    """
+    return [
         "mcporter",
         "call",
         "exa.web_search_exa",
@@ -176,7 +296,51 @@ async def search_web(query: str, limit: int) -> dict[str, Any]:
         "--timeout",
         str(int(COMMAND_TIMEOUT * 1000)),
     ]
-    return await run_command(*args)
+
+
+SourceSearch = Callable[[str, int], Awaitable[dict[str, Any]]]
+SOURCE_REGISTRY: dict[str, SourceSearch] = {
+    # Wrappers resolve the current function at call time, which keeps the
+    # registry patchable for offline adapter tests without a second dispatch
+    # table in callers.
+    "xiaohongshu": lambda query, limit: search_xiaohongshu(query, limit),
+    "bilibili": lambda query, limit: search_bilibili(query, limit),
+    "douyin": lambda query, limit: search_douyin(query, limit),
+    "web": lambda query, limit: search_web(query, limit),
+}
+SOURCE_NAMES = tuple(SOURCE_REGISTRY)
+
+
+def _aggregate_status(results: dict[str, dict[str, Any]]) -> str:
+    statuses = [result["status"] for result in results.values()]
+    if not statuses:
+        return "unavailable"
+    if all(status == "empty" for status in statuses):
+        return "empty"
+    if all(status in SUCCESS_STATUSES for status in statuses):
+        return "ok"
+    if any(status in SUCCESS_STATUSES for status in statuses):
+        return "partial"
+    return "unavailable"
+
+
+async def dispatch_sources(query: str, sources: list[str], limit: int) -> dict[str, dict[str, Any]]:
+    """Dispatch registered adapters and retain independent failures."""
+    jobs = [(source, SOURCE_REGISTRY[source](query, limit)) for source in sources]
+    raw_results = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
+    normalized: dict[str, dict[str, Any]] = {}
+    for (source, _), raw in zip(jobs, raw_results):
+        if isinstance(raw, Exception):
+            normalized[source] = normalize_adapter_result(
+                source,
+                {
+                    "process_ok": False,
+                    "error": _error("adapter_exception", str(raw)),
+                },
+            )
+        else:
+            normalized[source] = normalize_adapter_result(source, raw)
+    return normalized
 
 
 def city_to_slug(city_name: str) -> str:
@@ -248,32 +412,18 @@ async def social_search(
 ) -> dict[str, Any]:
     """Search read-only social/public sources.
 
-    sources may contain xiaohongshu, bilibili, and web.  Failed sources are
-    returned with their diagnostics instead of aborting the whole request.
+    ``sources=None`` uses the default sources. An explicit empty list or an
+    unknown source is a parameter error. Failed sources retain structured
+    diagnostics and do not discard successful results from other sources.
     """
-    if not query.strip():
-        raise ValueError("query must not be empty")
+    query = _validate_query(query)
     limit = max(1, min(limit, 20))
-    selected = sources or ["xiaohongshu", "bilibili", "web"]
-    jobs: list[tuple[str, Any]] = []
-    for source in selected:
-        if source == "xiaohongshu":
-            jobs.append((source, search_xiaohongshu(query, limit)))
-        elif source == "bilibili":
-            jobs.append((source, search_bilibili(query, limit)))
-        elif source == "web":
-            jobs.append((source, search_web(query, limit)))
-    results = await asyncio.gather(*(job for _, job in jobs), return_exceptions=True)
+    selected = _select_sources(sources)
+    results = await dispatch_sources(query, selected, limit)
     return {
         "query": query,
-        "results": {
-            source: (
-                {"ok": False, "error": str(result)}
-                if isinstance(result, Exception)
-                else result
-            )
-            for (source, _), result in zip(jobs, results)
-        },
+        "status": _aggregate_status(results),
+        "results": results,
     }
 
 
@@ -288,9 +438,9 @@ async def gaode_food_ranking(city_name: str, limit: int = 20) -> dict[str, Any]:
 @mcp.tool()
 async def douyin_search(query: str, limit: int = 10) -> dict[str, Any]:
     """Search Douyin videos as supplementary recent/local evidence."""
-    if not query.strip():
-        raise ValueError("query must not be empty")
-    return await search_douyin(query, max(1, min(limit, 30)))
+    query = _validate_query(query)
+    selected = await dispatch_sources(query, ["douyin"], max(1, min(limit, 30)))
+    return selected["douyin"]
 
 
 @mcp.tool()
