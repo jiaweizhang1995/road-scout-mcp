@@ -8,10 +8,13 @@ shell, posting, commenting, liking, or cookie-management tools.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import re
 import shutil
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from dotenv import load_dotenv
@@ -140,6 +143,215 @@ def _has_valid_shape(source: str, data: Any) -> bool:
     return False
 
 
+def _candidate_id(note_url: str) -> str:
+    match = re.search(
+        r"/(?:explore|note|search_result|discovery/item|user/profile/[^/]+)/([a-f0-9]+)(?:[/?#]|$)",
+        urlsplit(note_url).path,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group(1).lower()
+    return hashlib.sha256(note_url.encode("utf-8")).hexdigest()[:16]
+
+
+def _xhs_note_url(note_url: str) -> str:
+    """Validate, but never rewrite, a signed URL returned by search."""
+    cleaned = note_url.strip()
+    parsed = urlsplit(cleaned)
+    host = (parsed.hostname or "").lower()
+    supported_path = re.search(
+        r"^/(?:explore|note|search_result|discovery/item)/[a-f0-9]+(?:/|$)|^/user/profile/[^/]+/[a-f0-9]+(?:/|$)",
+        parsed.path,
+        re.IGNORECASE,
+    )
+    token = parse_qs(parsed.query).get("xsec_token", [""])[0].strip()
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not (host == "xiaohongshu.com" or host.endswith(".xiaohongshu.com"))
+        or supported_path is None
+        or not token
+    ):
+        raise ValueError("note_url must be the full signed Xiaohongshu URL returned by search")
+    return cleaned
+
+
+def _xhs_search_rows(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [row for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in ("results", "items", "data"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return [row for row in value if isinstance(row, dict)]
+    return []
+
+
+def dedupe_xiaohongshu_search_results(search_results: list[Any]) -> list[dict[str, Any]]:
+    """Turn one or more OpenCLI search arrays into unique Jev candidates."""
+    candidates: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for result in search_results:
+        for row in _xhs_search_rows(result):
+            url = row.get("url") or row.get("note_url")
+            if not isinstance(url, str) or not url.strip():
+                continue
+            url = url.strip()
+            candidate_id = _candidate_id(url)
+            if candidate_id in seen_ids:
+                continue
+            seen_ids.add(candidate_id)
+            title = row.get("title") or row.get("name") or ""
+            candidates.append(
+                {
+                    "candidate_id": candidate_id,
+                    "title": title,
+                    "name": title,
+                    "source": "xiaohongshu",
+                    "url": url,
+                    "author": row.get("author") or "",
+                    "text": "",
+                    "comments": row.get("comments"),
+                    "likes": row.get("likes"),
+                    "collects": row.get("collects"),
+                    "published_at": row.get("published_at"),
+                    "body_status": "not_read",
+                    "raw_search_result": row,
+                }
+            )
+    return candidates
+
+
+def dedupe_xiaohongshu_candidates(candidate_lists: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """Deduplicate already-normalized candidates while preserving first-seen order."""
+    unique: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for candidates in candidate_lists:
+        for candidate in candidates:
+            url = candidate.get("url")
+            candidate_id = candidate.get("candidate_id")
+            if not isinstance(url, str) or not url:
+                continue
+            key = candidate_id if isinstance(candidate_id, str) and candidate_id else _candidate_id(url)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def dedupe_xiaohongshu_evidence(evidence: list[dict[str, Any]]) -> None:
+    """Remove repeated Xiaohongshu candidates across nearby query groups."""
+    seen_ids: set[str] = set()
+    for query_evidence in evidence:
+        result = query_evidence.get("results", {}).get("xiaohongshu", {})
+        candidates = result.get("data") if isinstance(result, dict) else None
+        if not isinstance(candidates, list):
+            continue
+        unique = dedupe_xiaohongshu_candidates([candidates])
+        kept: list[dict[str, Any]] = []
+        for candidate in unique:
+            url = candidate.get("url")
+            candidate_id = candidate.get("candidate_id")
+            if not isinstance(url, str) or not url:
+                continue
+            key = candidate_id if isinstance(candidate_id, str) and candidate_id else _candidate_id(url)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            kept.append(candidate)
+        result["data"] = kept
+
+
+def _note_rows_to_mapping(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, list):
+        return None
+    mapping: dict[str, Any] = {}
+    for row in data:
+        if not isinstance(row, dict) or not isinstance(row.get("field"), str):
+            return None
+        mapping[row["field"]] = row.get("value")
+    return mapping
+
+
+def _empty_xhs_candidate(note_url: str) -> dict[str, Any]:
+    return {
+        "candidate_id": _candidate_id(note_url),
+        "title": "",
+        "name": "",
+        "source": "xiaohongshu",
+        "url": note_url,
+        "author": "",
+        "text": "",
+        "comments": None,
+        "likes": None,
+        "collects": None,
+        "published_at": None,
+        "body_status": "unavailable",
+    }
+
+
+def _xiaohongshu_note_result(note_url: str, raw: dict[str, Any]) -> dict[str, Any]:
+    candidate = _empty_xhs_candidate(note_url)
+    if not raw.get("process_ok", raw.get("ok", False)):
+        return {
+            "status": "unavailable",
+            "source": "xiaohongshu",
+            "candidate": candidate,
+            "data": raw.get("data"),
+            "error": raw.get("error") or _error("command_failed", "note command failed"),
+            "ok": False,
+        }
+    if raw.get("parse_error"):
+        return {
+            "status": "parse_error",
+            "source": "xiaohongshu",
+            "candidate": candidate,
+            "data": raw.get("data"),
+            "error": raw["parse_error"],
+            "ok": False,
+        }
+    fields = _note_rows_to_mapping(raw.get("data"))
+    if fields is None:
+        return {
+            "status": "parse_error",
+            "source": "xiaohongshu",
+            "candidate": candidate,
+            "data": raw.get("data"),
+            "error": _error("invalid_shape", "xiaohongshu note returned unexpected field rows"),
+            "ok": False,
+        }
+    candidate.update(
+        {
+            "title": fields.get("title") or "",
+            "name": fields.get("title") or "",
+            "author": fields.get("author") or "",
+            "comments": fields.get("comments"),
+            "likes": fields.get("likes"),
+            "collects": fields.get("collects"),
+            "text": fields.get("content") or "",
+            "body_status": "ok" if fields.get("content") else "unavailable",
+            "raw_note": raw.get("data"),
+        }
+    )
+    if not fields.get("content"):
+        return {
+            "status": "unavailable",
+            "source": "xiaohongshu",
+            "candidate": candidate,
+            "data": raw.get("data"),
+            "error": _error("missing_content", "xiaohongshu note returned no body content"),
+            "ok": False,
+        }
+    return {
+        "status": "ok",
+        "source": "xiaohongshu",
+        "candidate": candidate,
+        "data": raw.get("data"),
+        "error": None,
+        "ok": True,
+    }
+
+
 def normalize_adapter_result(source: str, raw: dict[str, Any]) -> dict[str, Any]:
     """Convert a command/MCP response to the public source result contract."""
     process_ok = raw.get("process_ok", raw.get("ok", False))
@@ -165,6 +377,8 @@ def normalize_adapter_result(source: str, raw: dict[str, Any]) -> dict[str, Any]
         status = "parse_error"
         error = _error("invalid_shape", f"{source} adapter returned an unexpected JSON shape")
     else:
+        if source == "xiaohongshu":
+            data = dedupe_xiaohongshu_search_results([data])
         status = requested_status if requested_status in SUCCESS_STATUSES else (
             "empty" if _data_is_empty(data) else "ok"
         )
@@ -240,6 +454,18 @@ async def search_douyin(query: str, limit: int) -> dict[str, Any]:
         query,
         "--limit",
         str(limit),
+        "-f",
+        "json",
+        expect_json=True,
+    )
+
+
+async def fetch_xiaohongshu_note(note_url: str) -> dict[str, Any]:
+    return await run_command(
+        OPENCLI,
+        "xiaohongshu",
+        "note",
+        note_url,
         "-f",
         "json",
         expect_json=True,
@@ -467,6 +693,14 @@ async def douyin_search(query: str, limit: int = 10) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def xiaohongshu_note(note_url: str) -> dict[str, Any]:
+    """Read one full Xiaohongshu note from a signed search-result URL."""
+    validated_url = _xhs_note_url(note_url)
+    raw = await fetch_xiaohongshu_note(validated_url)
+    return _xiaohongshu_note_result(validated_url, raw)
+
+
+@mcp.tool()
 async def xiaohongshu_comments(
     note_url: str,
     limit: int = 20,
@@ -557,6 +791,7 @@ async def nearby_discover(
         }
 
     evidence = await asyncio.gather(*(collect_query_evidence(query) for query in queries))
+    dedupe_xiaohongshu_evidence(evidence)
     gaode = await fetch_gaode_food_ranking(area_name, 20) if area_name.strip() else {
         "ok": False,
         "error": "area_name is required to query the Amap city food ranking",
