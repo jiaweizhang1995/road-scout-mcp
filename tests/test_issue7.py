@@ -3,12 +3,20 @@ import re
 import unittest
 from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock, patch
+from urllib.parse import quote
 
 import server
 
 
 def signed_url(note_id: str, token: str = "fixture-token") -> str:
     return f"https://www.xiaohongshu.com/explore/{note_id}?xsec_token={token}&xsec_source="
+
+
+def public_url(note_id: str, token: str = "fixture-token") -> str:
+    return (
+        f"https://www.xiaohongshu.com/discovery/item/{note_id}"
+        f"?xsec_token={quote(token, safe='')}&xsec_source=pc_search"
+    )
 
 
 def xhs_row(note_id: str, title: str, token: str = "fixture-token") -> dict:
@@ -206,8 +214,8 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
             max_results=5,
         )
         urls = [rec["url"] for rec in result["recommendations"]]
-        self.assertIn(signed_url("aa" * 12), urls)
-        self.assertIn(signed_url("bb" * 12), urls)
+        self.assertIn(public_url("aa" * 12), urls)
+        self.assertIn(public_url("bb" * 12), urls)
         self.assertGreaterEqual(len(result["recommendations"]), 2)
         for rec in result["recommendations"]:
             self.assertEqual(rec["evidence_status"], "supported")
@@ -280,10 +288,10 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
             jev_client=FakeJevClient(default_scorer),
         )
         urls = [rec["url"] for rec in result["recommendations"]]
-        self.assertEqual(urls, [signed_url("11" * 12)])
+        self.assertEqual(urls, [public_url("11" * 12)])
         self.assertEqual(result["stats"]["filtered"], 1)
         exploratory_urls = [item["url"] for item in result["exploratory"]]
-        self.assertNotIn(signed_url("22" * 12), exploratory_urls)
+        self.assertNotIn(public_url("22" * 12), exploratory_urls)
 
     async def test_marketing_risk_kept_with_risk_note(self):
         result, _ = await self._run(
@@ -368,6 +376,52 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["recommendations"], [])
         self.assertTrue(result["food"]["ok"])
         self.assertEqual(result["food"]["items"][0]["name"], "本地面馆")
+
+    async def test_recommendation_url_is_public_but_comments_use_signed(self):
+        note_id = "88" * 12
+        result, mocks = await self._run(
+            xhs=[xhs_row(note_id, "山顶草甸放空", token="tok=fixture=")],
+            notes={note_id: note_raw("山顶草甸", GAP_BODY)},
+            comments=["村口就有停车场，收费十元。"],
+            jev_client=FakeJevClient(default_scorer),
+        )
+        rec = result["recommendations"][0]
+        self.assertEqual(rec["url"], public_url(note_id, "tok=fixture="))
+        self.assertIn("%3D", rec["url"])
+        # internal comment fetch still received the original signed URL
+        self.assertEqual(mocks["comments"].await_args.args[0], signed_url(note_id, "tok=fixture="))
+
+
+class Issue7PublicUrlTests(unittest.TestCase):
+    def test_search_result_url_becomes_discovery_item(self):
+        url = (
+            "https://www.xiaohongshu.com/search_result/6aa5b9ac000000002802c70d"
+            "?xsec_token=ABwFzZtJo0HZhfis6qqKFMo4ZnD6isDCbJOd9roKWLcTM=&xsec_source="
+        )
+        self.assertEqual(
+            server._public_url(url),
+            "https://www.xiaohongshu.com/discovery/item/6aa5b9ac000000002802c70d"
+            "?xsec_token=ABwFzZtJo0HZhfis6qqKFMo4ZnD6isDCbJOd9roKWLcTM%3D&xsec_source=pc_search",
+        )
+
+    def test_explore_and_already_public_urls_normalize(self):
+        url = "https://www.xiaohongshu.com/explore/aa11bb22cc33dd44ee55ff66?xsec_token=tok==&xsec_source=pc_search"
+        self.assertEqual(
+            server._public_url(url),
+            "https://www.xiaohongshu.com/discovery/item/aa11bb22cc33dd44ee55ff66"
+            "?xsec_token=tok%3D%3D&xsec_source=pc_search",
+        )
+        # idempotent: a public URL rewrites to itself
+        self.assertEqual(server._public_url(server._public_url(url)), server._public_url(url))
+
+    def test_non_xhs_and_non_note_urls_pass_through(self):
+        bilibili = "https://www.bilibili.com/video/BV129ReB1ExM"
+        self.assertEqual(server._public_url(bilibili), bilibili)
+        profile = "https://www.xiaohongshu.com/user/profile/597429cf6a6a69287949f707?xsec_token=abc="
+        self.assertEqual(server._public_url(profile), profile)
+        no_token = "https://www.xiaohongshu.com/explore/aa11bb22cc33dd44ee55ff66"
+        self.assertEqual(server._public_url(no_token), no_token)
+        self.assertIsNone(server._public_url(None))
 
 
 if __name__ == "__main__":
