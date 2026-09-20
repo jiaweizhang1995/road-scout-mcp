@@ -1292,12 +1292,30 @@ def _comment_texts(raw: dict[str, Any]) -> list[str]:
 
 
 _PLACE_SUFFIX = "山顶|山|湖|村|镇|民宿|营地|景区|公园|古道|瀑布|溪谷|峡谷|草甸|农庄|水库|岛|溪|寺|桥|湾"
+# Generic verbs/prepositions that lead note phrases ("沿着山脊" -> 山) but never
+# start a real place name in this corpus; stripped before use.
+_PLACE_STRIP_PREFIX = "沿枕住藏躺在去到看玩来走爬逛向离约"
+# Modal/aspect particles that no place name contains; presence means the token
+# is a sentence fragment, not a place ("正的避世民宿").
+_PLACE_BAD_CHARS = "的着了呢吗吧啊哦呀嘛地被得"
+
+
+def _clean_place(place: str) -> str:
+    place = place.lstrip(_PLACE_STRIP_PREFIX)
+    if len(place) < 2 or any(char in place for char in _PLACE_BAD_CHARS):
+        return ""
+    return place
 
 
 def _extract_place(candidate: dict[str, Any]) -> str:
-    """Best-effort place token: longest suffix span in the first place-like run."""
+    """Best-effort place token: longest suffix span in the first place-like run.
+
+    A confident title match (suffix within the first few chars of a run) wins
+    outright; a title fallback beats any text-field hit so sentence fragments
+    like "沿着山脊" cannot override a real title place.
+    """
     fallback = ""
-    for field in (candidate.get("title"), candidate.get("text")):
+    for field_index, field in enumerate((candidate.get("title"), candidate.get("text"))):
         if not isinstance(field, str):
             continue
         for run in re.findall(r"[一-鿿]{2,}", field):
@@ -1305,8 +1323,10 @@ def _extract_place(candidate: dict[str, Any]) -> str:
             if not matches:
                 continue
             first, last = matches[0], matches[-1]
-            place = run[max(0, last.start() - 4) : last.end()]
-            if first.start() <= 3:
+            place = _clean_place(run[max(0, last.start() - 4) : last.end()])
+            if not place:
+                continue
+            if first.start() <= 3 and (field_index == 0 or not fallback):
                 return place
             if not fallback:
                 fallback = place
