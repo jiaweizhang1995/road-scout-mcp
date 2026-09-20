@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import unittest
 from contextlib import AsyncExitStack
 from unittest.mock import AsyncMock, patch
@@ -550,6 +551,65 @@ class Issue7GeoTests(unittest.TestCase):
             {"_place": "乙湖", "ranking": 0.7},  # len<3 -> never deduped
         ]
         self.assertEqual(len(server._dedupe_by_place(ranked)), 3)
+
+    def test_wgs84_to_gcj02_shifts_inside_china(self):
+        lat, lon = server._wgs84_to_gcj02(30.27, 120.15)
+        self.assertNotEqual((lat, lon), (30.27, 120.15))
+        # GCJ-02 offset is hundreds of meters, never tens of kilometers
+        self.assertLess(server._haversine_km(30.27, 120.15, lat, lon), 2.0)
+
+    def test_wgs84_to_gcj02_noop_outside_china(self):
+        self.assertEqual(server._wgs84_to_gcj02(51.5, -0.12), (51.5, -0.12))
+
+
+class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._saved_nominatim_ts = server._last_nominatim_call
+
+    async def asyncTearDown(self):
+        server._last_nominatim_call = self._saved_nominatim_ts
+
+    def _nominatim_client(self, rows):
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return None
+
+            async def get(self, url, params=None):
+                return FakeResponse(rows)
+
+        return Client()
+
+    async def test_nominatim_min_interval_enforced(self):
+        server._last_nominatim_call = time.monotonic()  # pretend a call just happened
+        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock, patch.object(
+            server.httpx, "AsyncClient", return_value=self._nominatim_client([])
+        ):
+            await server._nominatim_geocode("杭州", ("杭州",))
+        sleep_mock.assert_awaited_once()
+        self.assertGreater(sleep_mock.await_args.args[0], 0.5)
+
+    async def test_nominatim_no_sleep_after_interval(self):
+        server._last_nominatim_call = 0.0  # long ago
+        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock, patch.object(
+            server.httpx, "AsyncClient", return_value=self._nominatim_client([])
+        ):
+            await server._nominatim_geocode("杭州", ("杭州",))
+        sleep_mock.assert_not_awaited()
+
+    async def test_explicit_origin_converted_to_gcj02_under_amap(self):
+        with patch.object(server, "AMAP_API_KEY", "test-amap-key"):
+            lat, lon, label = await server._resolve_origin(30.27, 120.15, "")
+        self.assertEqual(label, "指定坐标")
+        self.assertNotEqual((lat, lon), (30.27, 120.15))
+        self.assertLess(server._haversine_km(30.27, 120.15, lat, lon), 2.0)
+
+    async def test_explicit_origin_unchanged_under_nominatim(self):
+        with patch.object(server, "AMAP_API_KEY", ""):
+            lat, lon, _ = await server._resolve_origin(30.27, 120.15, "")
+        self.assertEqual((lat, lon), (30.27, 120.15))
 
 
 class Issue7PublicUrlTests(unittest.TestCase):

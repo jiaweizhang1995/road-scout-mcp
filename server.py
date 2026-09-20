@@ -14,6 +14,7 @@ import math
 import os
 import re
 import shutil
+import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
@@ -63,7 +64,9 @@ EVIDENCE_KEYWORDS = PRACTICAL_KEYWORDS + (
 )
 AMAP_API_KEY = os.getenv("AMAP_API_KEY", "")
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_MIN_INTERVAL = 1.0  # OSMF public-service policy: at most 1 req/s
 GEO_TIMEOUT = 15
+_last_nominatim_call = 0.0
 
 mcp = FastMCP(
     "road-scout",
@@ -1507,6 +1510,11 @@ async def geocode_place(place: str, area: str) -> tuple[float, float, str] | Non
 
 
 async def _nominatim_geocode(query: str, must_contain: tuple[str, ...]) -> tuple[float, float, str] | None:
+    global _last_nominatim_call
+    delay = NOMINATIM_MIN_INTERVAL - (time.monotonic() - _last_nominatim_call)
+    if delay > 0:
+        await asyncio.sleep(delay)
+    _last_nominatim_call = time.monotonic()
     try:
         async with httpx.AsyncClient(
             timeout=GEO_TIMEOUT,
@@ -1532,14 +1540,49 @@ async def _nominatim_geocode(query: str, must_contain: tuple[str, ...]) -> tuple
         return None
 
 
+def _gcj02_shift_lat(x: float, y: float) -> float:
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320.0 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _gcj02_shift_lon(x: float, y: float) -> float:
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def _wgs84_to_gcj02(lat: float, lon: float) -> tuple[float, float]:
+    """WGS-84 -> GCJ-02. Only applies inside China; elsewhere coords are unchanged."""
+    if not (73.66 < lon < 135.05 and 3.86 < lat < 53.55):
+        return lat, lon
+    a, ee = 6378245.0, 0.006693421622965943
+    dlat = _gcj02_shift_lat(lon - 105.0, lat - 35.0)
+    dlon = _gcj02_shift_lon(lon - 105.0, lat - 35.0)
+    radlat = math.radians(lat)
+    magic = 1 - ee * math.sin(radlat) ** 2
+    dlat = (dlat * 180.0) / ((a * (1 - ee)) / (magic * math.sqrt(magic)) * math.pi)
+    dlon = (dlon * 180.0) / (a / math.sqrt(magic) * math.cos(radlat) * math.pi)
+    return lat + dlat, lon + dlon
+
+
 async def _resolve_origin(
     latitude: float | None, longitude: float | None, area: str
 ) -> tuple[float, float, str] | None:
     if latitude is not None and longitude is not None:
         try:
-            return float(latitude), float(longitude), "指定坐标"
+            lat, lon = float(latitude), float(longitude)
         except (TypeError, ValueError):
             return None
+        if AMAP_API_KEY:
+            # Caller coords are WGS-84; convert so they compare like-for-like
+            # with GCJ-02 POIs returned by the Amap API.
+            lat, lon = _wgs84_to_gcj02(lat, lon)
+        return lat, lon, "指定坐标"
     if area:
         return await geocode_area(area)
     return None
@@ -1609,10 +1652,10 @@ async def road_scout_recommend(
 
     Distance constraints come from ``radius_km`` or phrases like "附近100公里"/
     "500米" inside ``request`` (explicit ``radius_km`` wins). The origin is
-    ``latitude``/``longitude`` when both are given, otherwise ``area_name``
-    geocoded via Amap (AMAP_API_KEY) or Nominatim. Candidates beyond the radius
-    move to ``exploratory`` with their distance; unresolved places keep
-    ``distance_km=None`` and are never filtered out.
+    ``latitude``/``longitude`` (WGS-84) when both are given, otherwise
+    ``area_name`` geocoded via Amap (AMAP_API_KEY) or Nominatim. Candidates
+    beyond the radius move to ``exploratory`` with their distance; unresolved
+    places keep ``distance_km=None`` and are never filtered out.
     """
     request = _validate_query(request)
     max_results = max(1, min(max_results, 12))
@@ -1657,6 +1700,10 @@ async def road_scout_recommend(
                 ),
                 "radius_km": radius,
                 "provider": "amap" if AMAP_API_KEY else "nominatim",
+                "crs": "gcj02" if AMAP_API_KEY else "wgs84",
+                "attribution": (
+                    "© 高德地图" if AMAP_API_KEY else "© OpenStreetMap contributors (Nominatim)"
+                ),
             },
             "source_status": source_status,
             "notes": notes,

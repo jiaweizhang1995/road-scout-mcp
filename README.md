@@ -108,10 +108,14 @@ Followed-up candidates are re-ranked once.
 
 Distance constraints: `radius_km` caps how far recommendations may be, or the
 same limit is parsed from `request` ("附近100公里", "500米内"; the explicit
-parameter wins). The origin is `latitude`/`longitude` when both are given,
-otherwise `area_name` is geocoded — via Amap when `AMAP_API_KEY` is set, else
-Nominatim with a display-name sanity check (China POI coverage is limited;
-unresolved places keep `distance_km: null` and are never filtered out).
+parameter wins). The origin is `latitude`/`longitude` (declared WGS-84;
+converted to GCJ-02 automatically when `AMAP_API_KEY` is set so it compares
+like-for-like with Amap POIs) when both are given, otherwise `area_name` is
+geocoded — via Amap when `AMAP_API_KEY` is set, else Nominatim with a
+display-name sanity check (China POI coverage is limited; unresolved places
+keep `distance_km: null` and are never filtered out). Nominatim calls are
+throttled to the OSMF public-service limit of 1 request/second and the `geo`
+output carries attribution; data © OpenStreetMap contributors.
 Ranked candidates are deduplicated by place (multiple notes about one place
 collapse into a single entry with `mentions`), annotated with haversine
 distance, and anything known to be beyond the radius is moved to `exploratory`

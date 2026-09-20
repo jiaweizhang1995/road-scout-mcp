@@ -30,7 +30,7 @@ version: 1.5.0
 - `include_food`：包含吃饭需求时设为 true。
 - `max_results`：正式推荐上限，默认 5。候选不够好时返回更少，不凑数。
 - `radius_km`：距离上限（公里）。不传时会尝试从 `request` 解析“附近X公里/X米”；显式传参优先于文本解析。
-- `latitude` / `longitude`：起点坐标，需成对提供。缺省用 `area_name` 地理编码（配置了 `AMAP_API_KEY` 走高德，否则 Nominatim）。
+- `latitude` / `longitude`：起点坐标，需成对提供，按 WGS-84 传入（配置了 `AMAP_API_KEY` 时服务端自动转 GCJ-02 对齐高德 POI）。缺省用 `area_name` 地理编码（配置了 `AMAP_API_KEY` 走高德，否则 Nominatim）。
 
 距离语义：
 
