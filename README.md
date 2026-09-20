@@ -92,3 +92,17 @@ Use the Mac's Tailscale/private HTTPS address once configured:
 
 Keep the token in the Open Minis environment and in the Mac's local `.env`;
 never put it in a skill prompt or a source file.
+
+## Jev ranking contract
+
+`jev_rank_candidates` sends the Issue #3 candidate `text` and available comment
+evidence to Jev for three independent signals: `firsthand`, `marketing`, and
+`fit`. Explicit `user_preferences` are passed through to `fit`; defaults are
+used only when no preferences are supplied. Short or unavailable bodies become
+`evidence_status: "insufficient"` and are not forced into a low-quality verdict.
+
+The simple code-side ranking keeps detailed first-hand candidates near the top,
+filters high-marketing/low-firsthand candidates, and retains high-marketing
+content when it still contains useful route, parking, price, or limitation
+details. Likes are not used as an automatic filter. Jev outputs are ranking
+signals, not identity verification or factual proof.
