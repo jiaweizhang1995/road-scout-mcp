@@ -356,6 +356,19 @@ class Issue7FlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["food"]["ok"])
         self.assertEqual(result["food"]["items"][0]["name"], "本地面馆")
 
+    async def test_food_returned_even_when_social_pool_empty(self):
+        result, mocks = await self._run(
+            gaode={
+                "ok": True,
+                "items": [{"rank": 1, "name": "本地面馆", "score": "综合分4.5", "tags": None, "highlight": None, "url": "https://www.amap.com/x"}],
+            },
+            request="杭州吃什么",
+        )
+        mocks["gaode"].assert_awaited_once()
+        self.assertEqual(result["recommendations"], [])
+        self.assertTrue(result["food"]["ok"])
+        self.assertEqual(result["food"]["items"][0]["name"], "本地面馆")
+
 
 if __name__ == "__main__":
     unittest.main()

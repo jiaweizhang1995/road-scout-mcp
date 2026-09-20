@@ -1413,9 +1413,18 @@ async def road_scout_recommend(
         base.update(overrides)
         return base
 
+    food = None
+    if include_food or any(keyword in request for keyword in FOOD_KEYWORDS):
+        if area:
+            food = await fetch_gaode_food_ranking(area, 10)
+            if isinstance(food, dict) and food.get("ok"):
+                food["note"] = "高德榜单仅作候选参考，出发前确认营业与排队"
+        else:
+            notes.append("缺少 area_name，跳过高德美食榜")
+
     if not pool:
         notes.append("所有来源均未返回可用候选")
-        return result()
+        return result(food=food)
 
     relevance_terms = [term for term in [area, *cats] if term]
     selected = _preselect_candidates(pool, relevance_terms, MAX_RANKED_CANDIDATES)
@@ -1434,6 +1443,7 @@ async def road_scout_recommend(
         ]
         return result(
             exploratory=exploratory,
+            food=food,
             stats={"candidates": len(pool), "ranked": len(selected), "filtered": 0, "followups": 0},
         )
 
@@ -1459,15 +1469,6 @@ async def road_scout_recommend(
         if candidate.get("evidence_status") == "insufficient"
     ][:MAX_EXPLORATORY]
     filtered = sum(1 for candidate in ranked if candidate.get("evidence_status") == "filtered")
-
-    food = None
-    if include_food or any(keyword in request for keyword in FOOD_KEYWORDS):
-        if area:
-            food = await fetch_gaode_food_ranking(area, 10)
-            if isinstance(food, dict) and food.get("ok"):
-                food["note"] = "高德榜单仅作候选参考，出发前确认营业与排队"
-        else:
-            notes.append("缺少 area_name，跳过高德美食榜")
 
     return result(
         recommendations=recommendations,
