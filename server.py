@@ -50,6 +50,7 @@ MAX_SEARCH_QUERIES = 4
 SEARCH_LIMIT_PER_SOURCE = 10
 MAX_RANKED_CANDIDATES = 10
 MAX_FOLLOWUP_CANDIDATES = 3
+MIN_RECOMMEND_RANKING = 0.1
 FOLLOWUP_COMMENT_LIMIT = 15
 MAX_EXPLORATORY = 3
 FOOD_KEYWORDS = ("吃", "餐", "美食", "饭")
@@ -70,6 +71,7 @@ GEO_TIMEOUT = 15
 # silently drop bursts, so calls are spaced to stay comfortably under it.
 GEO_MIN_INTERVAL = {"nominatim": 1.0, "amap": 0.5}
 _last_geo_call: dict[str, float] = {}
+_xhs_search_lock = asyncio.Lock()
 
 
 async def _geo_throttle(provider: str) -> None:
@@ -503,17 +505,20 @@ def _select_sources(sources: list[str] | None) -> list[str]:
 
 
 async def search_xiaohongshu(query: str, limit: int) -> dict[str, Any]:
-    return await run_command(
-        OPENCLI,
-        "xiaohongshu",
-        "search",
-        query,
-        "--limit",
-        str(limit),
-        "-f",
-        "json",
-        expect_json=True,
-    )
+    # OpenCLI shares one browser session; overlapping searches can make a
+    # valid query look empty. Keep only this stateful adapter serialized.
+    async with _xhs_search_lock:
+        return await run_command(
+            OPENCLI,
+            "xiaohongshu",
+            "search",
+            query,
+            "--limit",
+            str(limit),
+            "-f",
+            "json",
+            expect_json=True,
+        )
 
 
 async def search_bilibili(query: str, limit: int) -> dict[str, Any]:
@@ -682,43 +687,64 @@ def city_to_slug(city_name: str) -> str:
     return "".join(lazy_pinyin(cleaned)).lower()
 
 
+def _food_city_names(city_name: str) -> list[str]:
+    """Return the requested city and one simple parent-city fallback."""
+    cleaned = re.sub(r"\s+", "", city_name.strip())
+    names = [cleaned]
+    # Common compact inputs such as ``广州番禺`` or ``杭州西湖`` omit the
+    # district suffix. Removing the final two characters gets the parent city
+    # without adding a city database or another dependency.
+    if len(cleaned) >= 4 and not cleaned.endswith(("市", "地区")):
+        names.append(cleaned[:-2])
+    return list(dict.fromkeys(name for name in names if name))
+
+
 async def fetch_gaode_food_ranking(city_name: str, limit: int) -> dict[str, Any]:
     """Read the public Amap city food ranking page (榜单, not ad search)."""
+    last_error: str | None = None
+    for requested_city in _food_city_names(city_name):
+        slug = city_to_slug(requested_city)
+        url = f"https://www.amap.com/ranking/{slug}/food"
+        try:
+            async with httpx.AsyncClient(
+                timeout=25,
+                follow_redirects=True,
+                headers={"User-Agent": "road-scout/0.1"},
+            ) as client:
+                response = await client.get(url)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            title = soup.title.get_text(" ", strip=True) if soup.title else url
+            items: list[dict[str, Any]] = []
+            for position, card in enumerate(soup.select(".poi-card")[:limit], 1):
+                name_node = card.select_one(".poi-name")
+                if not name_node:
+                    continue
+                details = [node.get_text(" ", strip=True) for node in card.select(".poi-detail-item")]
+                score = next((d for d in details if "综合分" in d), None)
+                tags = next((d for d in details if d.startswith("🏷️")), None)
+                highlight = next((d for d in details if d.startswith("💡")), None)
+                href = card.get("href")
+                items.append(
+                    {
+                        "rank": position,
+                        "name": name_node.get_text(" ", strip=True),
+                        "score": score,
+                        "tags": tags,
+                        "highlight": highlight,
+                        "url": f"https://www.amap.com{href}" if href else None,
+                    }
+                )
+            if items or requested_city == _food_city_names(city_name)[-1]:
+                result = {"ok": True, "city": requested_city, "city_slug": slug, "url": url, "title": title, "items": items}
+                if requested_city != city_name.strip():
+                    result["requested_city"] = city_name.strip()
+                    result["fallback"] = True
+                return result
+        except Exception as exc:
+            last_error = str(exc)
     slug = city_to_slug(city_name)
-    url = f"https://www.amap.com/ranking/{slug}/food"
-    try:
-        async with httpx.AsyncClient(
-            timeout=25,
-            follow_redirects=True,
-            headers={"User-Agent": "road-scout/0.1"},
-        ) as client:
-            response = await client.get(url)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        title = soup.title.get_text(" ", strip=True) if soup.title else url
-        items: list[dict[str, Any]] = []
-        for position, card in enumerate(soup.select(".poi-card")[:limit], 1):
-            name_node = card.select_one(".poi-name")
-            if not name_node:
-                continue
-            details = [node.get_text(" ", strip=True) for node in card.select(".poi-detail-item")]
-            score = next((d for d in details if "综合分" in d), None)
-            tags = next((d for d in details if d.startswith("🏷️")), None)
-            highlight = next((d for d in details if d.startswith("💡")), None)
-            href = card.get("href")
-            items.append(
-                {
-                    "rank": position,
-                    "name": name_node.get_text(" ", strip=True),
-                    "score": score,
-                    "tags": tags,
-                    "highlight": highlight,
-                    "url": f"https://www.amap.com{href}" if href else None,
-                }
-            )
-        return {"ok": True, "city": city_name, "city_slug": slug, "url": url, "title": title, "items": items}
-    except Exception as exc:
-        return {"ok": False, "city": city_name, "city_slug": slug, "url": url, "error": str(exc)}
+    return {"ok": False, "city": city_name, "city_slug": slug, "url": f"https://www.amap.com/ranking/{slug}/food", "error": last_error or "food ranking returned no items"}
 
 
 @mcp.tool()
@@ -1846,7 +1872,10 @@ async def road_scout_recommend(
             ranked.sort(key=lambda item: item.get("ranking", -1.0), reverse=True)
 
     def recommendable(candidate: dict[str, Any]) -> bool:
-        return candidate.get("evidence_status") in ("supported", "marketing_risk")
+        return (
+            candidate.get("evidence_status") in ("supported", "marketing_risk")
+            and (candidate.get("ranking") or 0.0) >= MIN_RECOMMEND_RANKING
+        )
 
     recommendations = [
         _to_recommendation(candidate)
@@ -1856,8 +1885,12 @@ async def road_scout_recommend(
     exploratory = [
         _to_recommendation(candidate)
         for candidate in ranked
-        if (recommendable(candidate) and candidate.get("out_of_range"))
-        or candidate.get("evidence_status") == "insufficient"
+        if (
+            (candidate.get("evidence_status") in ("supported", "marketing_risk")
+             and not recommendable(candidate))
+            or (recommendable(candidate) and candidate.get("out_of_range"))
+            or candidate.get("evidence_status") == "insufficient"
+        )
     ][:MAX_EXPLORATORY]
     filtered = sum(1 for candidate in ranked if candidate.get("evidence_status") == "filtered")
 
