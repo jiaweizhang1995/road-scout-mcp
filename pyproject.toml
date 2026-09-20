@@ -1,0 +1,17 @@
+[project]
+name = "road-scout-mcp"
+version = "0.1.0"
+description = "Read-only MCP server for nearby road-trip discovery"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.13.5",
+    "httpx>=0.28.1",
+    "pypinyin>=0.55.0",
+    "mcp>=1.9,<2",
+    "python-dotenv>=1.2.1",
+    "pydantic-settings>=2.15.0",
+]
+
+[project.scripts]
+road-scout-mcp = "server:cli"
