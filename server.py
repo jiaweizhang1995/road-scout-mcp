@@ -1503,8 +1503,11 @@ async def geocode_place(place: str, area: str) -> tuple[float, float, str] | Non
         )
         pois = (body or {}).get("pois") or []
         point = _split_lng_lat(pois[0].get("location")) if pois else None
-        if point:
-            return point[0], point[1], str(pois[0].get("name") or place)
+        name = str(pois[0].get("name") or "") if pois else ""
+        # Amap fuzzy-matches aggressively; only trust a POI whose name shares
+        # the queried place, otherwise report unknown instead of a wrong fix.
+        if point and (place in name or (len(name) >= 3 and name in place)):
+            return point[0], point[1], name
         return None
     return await _nominatim_geocode(f"{place} {area}".strip(), must_contain=(place,))
 

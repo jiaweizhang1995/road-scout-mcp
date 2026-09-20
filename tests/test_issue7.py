@@ -611,6 +611,25 @@ class Issue7GeoAsyncTests(unittest.IsolatedAsyncioTestCase):
             lat, lon, _ = await server._resolve_origin(30.27, 120.15, "")
         self.assertEqual((lat, lon), (30.27, 120.15))
 
+    async def test_amap_fuzzy_mismatch_rejected(self):
+        body = {
+            "status": "1",
+            "pois": [{"name": "磨溪景区", "location": "119.413575,26.051775"}],
+        }
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server, "_amap_get", new=AsyncMock(return_value=body)
+        ):
+            # "龙溪草甸" must not silently become the unrelated 磨溪景区
+            self.assertIsNone(await server.geocode_place("龙溪草甸", "福州"))
+
+        body["pois"] = [{"name": "福州市鼓山旅游景区", "location": "119.375610,26.053221"}]
+        with patch.object(server, "AMAP_API_KEY", "key"), patch.object(
+            server, "_amap_get", new=AsyncMock(return_value=body)
+        ):
+            result = await server.geocode_place("鼓山", "福州")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[2], "福州市鼓山旅游景区")
+
 
 class Issue7PublicUrlTests(unittest.TestCase):
     def test_search_result_url_becomes_discovery_item(self):
