@@ -42,6 +42,24 @@ SUCCESS_STATUSES = {"ok", "empty", "partial"}
 FAILURE_STATUSES = {"unavailable", "parse_error"}
 DEFAULT_USER_PREFERENCES = ("小众", "人少", "本地体验", "适合自驾")
 MIN_JEV_TEXT_LENGTH = 20
+RECOMMEND_SOURCES = ("xiaohongshu", "bilibili", "douyin", "web")
+DEFAULT_RECOMMEND_CATEGORIES = ("山野", "民宿", "本地体验")
+MAX_SEARCH_QUERIES = 4
+SEARCH_LIMIT_PER_SOURCE = 10
+MAX_RANKED_CANDIDATES = 10
+MAX_FOLLOWUP_CANDIDATES = 3
+FOLLOWUP_COMMENT_LIMIT = 15
+MAX_EXPLORATORY = 3
+FOOD_KEYWORDS = ("吃", "餐", "美食", "饭")
+# A candidate missing every one of these topics is treated as having a
+# practical-information gap worth one targeted follow-up.
+PRACTICAL_KEYWORDS = (
+    "停车", "门票", "预约", "排队", "营业", "闭店", "路况",
+    "收费", "价格", "费用", "踩坑", "限行",
+)
+EVIDENCE_KEYWORDS = PRACTICAL_KEYWORDS + (
+    "路线", "公里", "小时", "分钟", "信号", "人多", "人少", "导航", "泥", "滑",
+)
 
 mcp = FastMCP(
     "road-scout",
@@ -812,14 +830,19 @@ def _candidate_text_for_jev(candidate: dict[str, Any]) -> str:
     text = candidate.get("text")
     if not isinstance(text, str):
         text = ""
-    comment_evidence = candidate.get("comments")
-    if isinstance(comment_evidence, list):
-        comment_text = "\n".join(
+    extras: list[str] = []
+    comments = candidate.get("comments")
+    if isinstance(comments, list):
+        extras.extend(
             str(item.get("text", item)) if isinstance(item, dict) else str(item)
-            for item in comment_evidence
-        ).strip()
-        if comment_text:
-            return f"{text.strip()}\n评论证据：{comment_text}".strip()
+            for item in comments
+        )
+    comment_evidence = candidate.get("comment_evidence")
+    if isinstance(comment_evidence, list):
+        extras.extend(str(item) for item in comment_evidence)
+    extra_text = "\n".join(item for item in extras if item).strip()
+    if extra_text:
+        return f"{text.strip()}\n补充证据：{extra_text}".strip()
     return text.strip()
 
 
@@ -841,6 +864,7 @@ def _jev_candidate_state(candidate: dict[str, Any]) -> dict[str, Any]:
             "author",
             "text",
             "comments",
+            "comment_evidence",
             "likes",
             "collects",
             "published_at",
@@ -1004,6 +1028,459 @@ async def jev_rank_candidates(candidates: list[dict[str, Any]], user_preferences
             return {"ok": True, "answers": answers, "results": results, "candidates": results, "model": body.get("model", payload["model"])}
     except Exception as exc:  # keep the MCP tool useful when the service is unavailable
         return {"ok": False, "error": str(exc), "candidates": candidates}
+
+
+# --- High-level recommend pipeline -----------------------------------------
+# search -> dedupe -> read Xiaohongshu bodies -> Jev -> targeted follow-up ->
+# final recommendations.  Kept deliberately small: two research rounds at most.
+
+
+def _recommend_queries(request: str, area: str, categories: list[str]) -> list[str]:
+    """Build a few plain queries; never stuff preference words into them."""
+    anchor = area or request
+    connector = "" if "周边" in anchor else "周边 "
+    queries: list[str] = []
+    if not area:
+        queries.append(request)
+    for category in categories[: 3 if area else 2]:
+        queries.append(f"{anchor} {connector}{category}")
+    queries.append(f"{anchor} {categories[0]} 实际体验")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for query in queries:
+        query = " ".join(query.split())
+        if query and query not in seen:
+            seen.add(query)
+            unique.append(query)
+    return unique[:MAX_SEARCH_QUERIES]
+
+
+def _candidate_dedupe_key(candidate: dict[str, Any]) -> str:
+    url = (candidate.get("url") or "").strip()
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "xiaohongshu.com" or host.endswith(".xiaohongshu.com"):
+        return f"xhs:{_candidate_id(url)}"
+    return f"{host}{urlsplit(url).path.rstrip('/')}"
+
+
+def _dedupe_pool(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate across queries and sources; a signed XHS URL wins over an unsigned copy."""
+    seen: dict[str, int] = {}
+    unique: list[dict[str, Any]] = []
+    for candidate in pool:
+        key = _candidate_dedupe_key(candidate)
+        index = seen.get(key)
+        if index is None:
+            seen[key] = len(unique)
+            unique.append(candidate)
+        elif "xsec_token=" in (candidate.get("url") or "") and "xsec_token=" not in (
+            unique[index].get("url") or ""
+        ):
+            unique[index] = candidate
+    return unique
+
+
+def _social_row_candidate(row: dict[str, Any], source: str) -> dict[str, Any] | None:
+    url = row.get("url") or row.get("link") or row.get("share_url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    title = row.get("title") or row.get("desc") or ""
+    text = row.get("desc") or row.get("description") or row.get("content") or ""
+    return {
+        "candidate_id": _candidate_id(url),
+        "title": title,
+        "name": title,
+        "source": source,
+        "url": url,
+        "author": row.get("author") or "",
+        "text": text if isinstance(text, str) else "",
+        "comments": None,
+        "likes": row.get("likes") if row.get("likes") is not None else row.get("score"),
+        "collects": None,
+        "published_at": row.get("published_at"),
+        "evidence_level": "snippet",
+    }
+
+
+def _web_result_candidates(data: Any) -> list[dict[str, Any]]:
+    """Parse Exa text blocks shaped as `Title:/URL:/Published:/Author:/Highlights:` groups."""
+    if not isinstance(data, dict):
+        return []
+    candidates: list[dict[str, Any]] = []
+    for block in data.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        for segment in re.split(r"(?m)(?=^Title: )", block.get("text") or ""):
+            url_match = re.search(r"(?m)^URL: (\S+)", segment)
+            if not url_match:
+                continue
+            url = url_match.group(1).strip()
+            title_match = re.search(r"(?m)^Title: (.+)", segment)
+            author_match = re.search(r"(?m)^Author: (.+)", segment)
+            published_match = re.search(r"(?m)^Published: (.+)", segment)
+            body_match = re.search(r"(?m)^Highlights:\s*\n(.*)", segment, re.DOTALL)
+            title = title_match.group(1).strip() if title_match else ""
+            author = author_match.group(1).strip() if author_match else ""
+            published = published_match.group(1).strip() if published_match else ""
+            candidates.append(
+                {
+                    "candidate_id": _candidate_id(url),
+                    "title": title,
+                    "name": title,
+                    "source": "web",
+                    "url": url,
+                    "author": "" if author == "N/A" else author,
+                    "text": (body_match.group(1).strip() if body_match else "")[:800],
+                    "comments": None,
+                    "likes": None,
+                    "collects": None,
+                    "published_at": None if published == "N/A" else published,
+                    "evidence_level": "snippet",
+                }
+            )
+    return candidates
+
+
+def _summarize_source_status(statuses: list[str]) -> str:
+    return _aggregate_status({str(index): {"status": status} for index, status in enumerate(statuses)})
+
+
+def _collect_candidates(
+    per_query_results: list[dict[str, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    pool: list[dict[str, Any]] = []
+    status_lists: dict[str, list[str]] = {source: [] for source in RECOMMEND_SOURCES}
+    for results in per_query_results:
+        for source, result in results.items():
+            status_lists.setdefault(source, []).append(result.get("status", "unavailable"))
+            if result.get("status") not in SUCCESS_STATUSES:
+                continue
+            data = result.get("data")
+            if source == "xiaohongshu":
+                pool.extend(c for c in (data or []) if isinstance(c, dict))
+            elif source in ("bilibili", "douyin"):
+                for row in _xhs_search_rows(data):
+                    candidate = _social_row_candidate(row, source)
+                    if candidate:
+                        pool.append(candidate)
+            elif source == "web":
+                pool.extend(_web_result_candidates(data))
+    source_status = {
+        source: _summarize_source_status(statuses)
+        for source, statuses in status_lists.items()
+    }
+    return _dedupe_pool(pool), source_status
+
+
+def _preselect_candidates(
+    pool: list[dict[str, Any]], terms: list[str], limit: int
+) -> list[dict[str, Any]]:
+    """Prefer relevant, body-readable candidates; deprioritize but never drop."""
+
+    def order(item: tuple[int, dict[str, Any]]) -> tuple[int, int, int]:
+        index, candidate = item
+        haystack = f"{candidate.get('title') or ''} {candidate.get('text') or ''}"
+        relevant = not terms or any(term and term in haystack for term in terms)
+        readable = candidate.get("source") == "xiaohongshu"
+        return (0 if relevant else 1, 0 if readable else 1, index)
+
+    return [candidate for _, candidate in sorted(enumerate(pool), key=order)[:limit]]
+
+
+async def _read_xhs_bodies(candidates: list[dict[str, Any]]) -> None:
+    """Read note bodies in place; failures keep the candidate marked unavailable."""
+
+    async def read_one(candidate: dict[str, Any]) -> None:
+        try:
+            url = _xhs_note_url(candidate.get("url") or "")
+        except ValueError:
+            candidate["body_status"] = "unavailable"
+            return
+        result = _xiaohongshu_note_result(url, await fetch_xiaohongshu_note(url))
+        note = result["candidate"]
+        if result["status"] == "ok":
+            candidate.update(
+                {
+                    key: note[key]
+                    for key in (
+                        "title", "name", "author", "text", "comments",
+                        "likes", "collects", "published_at", "body_status",
+                    )
+                }
+            )
+            candidate["evidence_level"] = "body"
+        else:
+            candidate["body_status"] = "unavailable"
+
+    await asyncio.gather(
+        *(read_one(c) for c in candidates if c.get("source") == "xiaohongshu")
+    )
+
+
+def _comment_texts(raw: dict[str, Any]) -> list[str]:
+    if not isinstance(raw, dict) or not raw.get("process_ok", raw.get("ok")) or raw.get("parse_error"):
+        return []
+    return [
+        row["text"].strip()
+        for row in _xhs_search_rows(raw.get("data"))
+        if isinstance(row.get("text"), str) and row["text"].strip()
+    ]
+
+
+_PLACE_SUFFIX = "山顶|山|湖|村|镇|民宿|营地|景区|公园|古道|瀑布|溪谷|峡谷|草甸|农庄|水库|岛|溪|寺|桥|湾"
+
+
+def _extract_place(candidate: dict[str, Any]) -> str:
+    """Best-effort place token for one targeted follow-up query."""
+    fallback = ""
+    for field in (candidate.get("title"), candidate.get("text")):
+        if not isinstance(field, str):
+            continue
+        for run in re.findall(r"[一-鿿]{2,}", field):
+            match = re.search(_PLACE_SUFFIX, run)
+            if not match:
+                continue
+            place = run[max(0, match.start() - 4) : match.end()]
+            if match.start() <= 3:
+                return place
+            if not fallback:
+                fallback = place
+    return fallback
+
+
+def _has_practical_info(candidate: dict[str, Any]) -> bool:
+    blob = f"{candidate.get('title') or ''} {_candidate_text_for_jev(candidate)}"
+    return any(keyword in blob for keyword in PRACTICAL_KEYWORDS)
+
+
+def _followup_targets(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Only promising candidates missing key practical info get one follow-up."""
+    targets: list[dict[str, Any]] = []
+    for candidate in ranked:
+        if len(targets) >= MAX_FOLLOWUP_CANDIDATES:
+            break
+        status = candidate.get("evidence_status")
+        if status == "filtered" or candidate.get("followed_up"):
+            continue
+        if _has_practical_info(candidate):
+            continue
+        if status in ("supported", "marketing_risk") and (candidate.get("ranking") or 0) < 0.1:
+            continue
+        if status == "insufficient" and candidate.get("body_status") == "unavailable":
+            continue  # comments alone cannot rescue a missing body
+        if candidate.get("source") == "xiaohongshu" or _extract_place(candidate):
+            targets.append(candidate)
+    return targets
+
+
+async def _followup_candidate(candidate: dict[str, Any]) -> None:
+    """One shot at the missing detail: XHS comments, else one targeted web query."""
+    candidate["followed_up"] = True
+    if candidate.get("source") == "xiaohongshu":
+        texts = _comment_texts(
+            await fetch_xiaohongshu_comments(
+                candidate.get("url") or "", FOLLOWUP_COMMENT_LIMIT, False
+            )
+        )
+        if texts:
+            candidate["comment_evidence"] = texts
+            return
+    place = _extract_place(candidate)
+    if not place:
+        return
+    results = await dispatch_sources(f"{place} 停车 门票 营业", ["web"], 5)
+    web = results.get("web", {})
+    if web.get("status") in SUCCESS_STATUSES:
+        snippets = [
+            f"{c['title']}：{c['text'][:120]}"
+            for c in _web_result_candidates(web.get("data"))[:3]
+            if c.get("text")
+        ]
+        if snippets:
+            candidate["comment_evidence"] = snippets
+
+
+def _extract_key_evidence(candidate: dict[str, Any]) -> list[str]:
+    blobs = []
+    if isinstance(candidate.get("text"), str) and candidate["text"].strip():
+        blobs.append(candidate["text"])
+    blobs.extend(str(item) for item in candidate.get("comment_evidence") or [])
+    sentences: list[str] = []
+    for blob in blobs:
+        for sentence in re.split(r"[。！？!?\n]+", blob):
+            sentence = sentence.strip()
+            if len(sentence) >= 8 and not sentence.startswith("#") and re.search(r"[一-鿿]", sentence):
+                sentences.append(sentence[:80])
+    if not sentences:
+        return []
+    picked = [s for s in sentences if any(k in s for k in EVIDENCE_KEYWORDS)]
+    return (picked or sentences)[:2]
+
+
+def _risks_for(candidate: dict[str, Any]) -> list[str]:
+    risks: list[str] = []
+    if candidate.get("evidence_status") == "marketing_risk":
+        risks.append("内容有营销/合作倾向，建议核实是否为商家宣传")
+    if candidate.get("body_status") == "unavailable":
+        risks.append("正文读取失败，仅有标题与搜索摘要")
+    elif candidate.get("evidence_level") == "snippet":
+        risks.append("仅搜索摘要，未读取正文")
+    if candidate.get("comment_evidence"):
+        risks.append("部分信息来自评论或补搜，可能已变化")
+    if not _has_practical_info(candidate):
+        risks.append("缺少停车、门票等实用信息，出发前需自行核实")
+    return risks
+
+
+def _to_recommendation(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": candidate.get("title") or candidate.get("name") or "",
+        "source": candidate.get("source"),
+        "url": candidate.get("url"),
+        "reason": candidate.get("reason"),
+        "evidence_status": candidate.get("evidence_status"),
+        "firsthand": _noul_value(candidate.get("firsthand")),
+        "marketing": _noul_value(candidate.get("marketing")),
+        "fit": _score_value(candidate.get("fit")),
+        "ranking": candidate.get("ranking"),
+        "key_evidence": _extract_key_evidence(candidate),
+        "risks": _risks_for(candidate),
+    }
+
+
+async def _safe_dispatch(query: str, sources: list[str], limit: int) -> dict[str, dict[str, Any]]:
+    try:
+        return await dispatch_sources(query, sources, limit)
+    except Exception as exc:
+        return {
+            source: normalize_adapter_result(
+                source,
+                {"process_ok": False, "error": _error("dispatch_exception", str(exc))},
+            )
+            for source in sources
+        }
+
+
+@mcp.tool()
+async def road_scout_recommend(
+    request: str,
+    area_name: str = "",
+    categories: list[str] | None = None,
+    preferences: list[str] | None = None,
+    include_food: bool = False,
+    max_results: int = 5,
+) -> dict[str, Any]:
+    """One-call recommend: search -> dedupe -> read bodies -> Jev -> gap-fill -> output.
+
+    ``request`` is the user's own words (e.g. "杭州附近小众自驾"). ``area_name``
+    anchors queries to a place; when empty, ``request`` is the anchor. Failed
+    sources are skipped, never fatal. ``max_results`` caps formal
+    recommendations; weaker leads land in ``exploratory`` instead of padding.
+    """
+    request = _validate_query(request)
+    max_results = max(1, min(max_results, 12))
+    cats = [
+        c.strip() for c in (categories or DEFAULT_RECOMMEND_CATEGORIES) if isinstance(c, str) and c.strip()
+    ][:3] or list(DEFAULT_RECOMMEND_CATEGORIES)
+    prefs = list(DEFAULT_USER_PREFERENCES if preferences is None else preferences)
+    area = area_name.strip()
+    queries = _recommend_queries(request, area, cats)
+    notes: list[str] = []
+
+    per_query = await asyncio.gather(
+        *(_safe_dispatch(query, list(RECOMMEND_SOURCES), SEARCH_LIMIT_PER_SOURCE) for query in queries)
+    )
+    pool, source_status = _collect_candidates(per_query)
+    for source, status in source_status.items():
+        if status in FAILURE_STATUSES:
+            notes.append(f"{source} 搜索失败，结果仅来自其他来源")
+        elif status in ("partial", "empty"):
+            notes.append(f"{source} 结果不完整或为空")
+
+    def result(**overrides: Any) -> dict[str, Any]:
+        base = {
+            "request": request,
+            "area_name": area or None,
+            "queries": queries,
+            "recommendations": [],
+            "exploratory": [],
+            "food": None,
+            "source_status": source_status,
+            "notes": notes,
+            "stats": {"candidates": len(pool), "ranked": 0, "filtered": 0, "followups": 0},
+        }
+        base.update(overrides)
+        return base
+
+    food = None
+    if include_food or any(keyword in request for keyword in FOOD_KEYWORDS):
+        if area:
+            food = await fetch_gaode_food_ranking(area, 10)
+            if isinstance(food, dict) and food.get("ok"):
+                food["note"] = "高德榜单仅作候选参考，出发前确认营业与排队"
+        else:
+            notes.append("缺少 area_name，跳过高德美食榜")
+
+    if not pool:
+        notes.append("所有来源均未返回可用候选")
+        return result(food=food)
+
+    relevance_terms = [term for term in [area, *cats] if term]
+    selected = _preselect_candidates(pool, relevance_terms, MAX_RANKED_CANDIDATES)
+    await _read_xhs_bodies(selected)
+
+    ranked_result = await jev_rank_candidates(selected, prefs)
+    if not ranked_result.get("ok"):
+        notes.append(f"Jev 不可用：{ranked_result.get('error') or 'unknown error'}")
+        exploratory = [
+            {
+                **_to_recommendation(candidate),
+                "evidence_status": "unranked",
+                "reason": "Jev 未返回判断，候选未排序",
+            }
+            for candidate in selected
+        ]
+        return result(
+            exploratory=exploratory,
+            food=food,
+            stats={"candidates": len(pool), "ranked": len(selected), "filtered": 0, "followups": 0},
+        )
+
+    ranked = ranked_result["results"]
+
+    targets = _followup_targets(ranked)
+    if targets:
+        await asyncio.gather(*(_followup_candidate(target) for target in targets))
+        rerank = await jev_rank_candidates(targets, prefs)
+        if rerank.get("ok"):
+            updated = {item.get("candidate_id"): item for item in rerank["results"]}
+            ranked = [updated.get(candidate.get("candidate_id"), candidate) for candidate in ranked]
+            ranked.sort(key=lambda item: item.get("ranking", -1.0), reverse=True)
+
+    recommendations = [
+        _to_recommendation(candidate)
+        for candidate in ranked
+        if candidate.get("evidence_status") in ("supported", "marketing_risk")
+    ][:max_results]
+    exploratory = [
+        _to_recommendation(candidate)
+        for candidate in ranked
+        if candidate.get("evidence_status") == "insufficient"
+    ][:MAX_EXPLORATORY]
+    filtered = sum(1 for candidate in ranked if candidate.get("evidence_status") == "filtered")
+
+    return result(
+        recommendations=recommendations,
+        exploratory=exploratory,
+        food=food,
+        stats={
+            "candidates": len(pool),
+            "ranked": len(selected),
+            "filtered": filtered,
+            "followups": len(targets),
+        },
+    )
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):

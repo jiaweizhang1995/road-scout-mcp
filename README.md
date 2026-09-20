@@ -93,6 +93,25 @@ Use the Mac's Tailscale/private HTTPS address once configured:
 Keep the token in the Open Minis environment and in the Mac's local `.env`;
 never put it in a skill prompt or a source file.
 
+## High-level recommend flow
+
+`road_scout_recommend(request, area_name, categories, preferences, include_food, max_results)`
+is the single-call entry point. It generates a few plain queries
+(`<area> 周边 <category>` plus one `<area> <category> 实际体验`), searches all four
+sources, deduplicates candidates across queries (Xiaohongshu by note identity,
+so a signed search hit wins over an unsigned copy), reads note bodies for the
+top ~10 preselected candidates, runs `jev_rank_candidates`, and only then does
+at most one targeted follow-up (XHS comments or one `<place> 停车 门票 营业`
+web query) for promising candidates that still lack practical details like
+parking, tickets, or opening hours. Followed-up candidates are re-ranked once.
+
+The result is `recommendations` (`supported`/`marketing_risk`, capped by
+`max_results`, never padded), a small `exploratory` list for `insufficient`
+leads, an optional `food` section from the Amap city ranking when the request
+is about eating, per-source `source_status`, and `notes`. A failed source never
+fails the whole call. Non-Xiaohongshu candidates rely on search snippets and
+are marked as weaker evidence in `risks`.
+
 ## Jev ranking contract
 
 `jev_rank_candidates` sends the Issue #3 candidate `text` and available comment
